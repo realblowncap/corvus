@@ -950,7 +950,7 @@ impl Searcher {
         v
     }
 
-    pub pub fn pv_line(&mut self, max: usize) -> Vec<Move> {
+    pub fn pv_line(&mut self, max: usize) -> Vec<Move> {
         let mut out = Vec::new();
         let mut made = Vec::new();
         for _ in 0..max {
@@ -1058,6 +1058,25 @@ mod tests {
     #[test]
     fn faster_mate_scores_higher() {
         assert!(MATE - 2 > MATE - 4, "mate-in-1 must outrank mate-in-2");
+    }
+
+    #[test]
+    fn think_depth_12_completes() {
+        let mut b = Board::startpos();
+        let mut s = Searcher::new(b);
+        let r = s.think(SearchLimits { depth: 12, ..SearchLimits::default() });
+        assert!(r.depth >= 12, "expected depth >= 12, got {}", r.depth);
+        assert!(r.best.is_some(), "expected a best move at depth 12");
+        assert!(r.nodes > 0, "expected some nodes at depth 12");
+    }
+
+    #[test]
+    fn think_depth_12_pv_line_computable() {
+        let mut b = Board::startpos();
+        let mut s = Searcher::new(b);
+        let _ = s.think(SearchLimits { depth: 12, ..SearchLimits::default() });
+        let pv = s.pv_line(2);
+        assert!(pv.len() >= 1, "PV line should have at least one move");
     }
 }
 

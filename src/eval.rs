@@ -216,6 +216,7 @@ pub fn evaluate(b: &Board) -> i32 {
 
     for c in 0..2 {
         let mut side = 0i32;
+        let _pawn_direction = if c == WHITE { 1 } else { -1 };
         let own = b.occ[c];
         let ering = KING_ATTACKS[b.kingsq[c ^ 1]] | bit(b.kingsq[c ^ 1]);
         let mut attackers = 0;
@@ -655,7 +656,6 @@ pub fn evaluate(b: &Board) -> i32 {
         let king_rank = rank_of(king_sq);
         
         // Check if there are pawns in front of the king that could be pushed
-        let pawn_direction = if c == WHITE { 1 } else { -1 };
         let pawn_rank = if c == WHITE { king_rank - 1 } else { king_rank + 1 };
         
         if pawn_rank < 8 && pawn_rank < 8 {
