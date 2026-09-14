@@ -74,5 +74,8 @@ fn main() {
             _ => {}
         }
     }
+    // Lightweight builtin bench/utility: allow running a depth-limited think from CLI
+    // Example: cargo run -- bench 20
+    // If invoked as a standalone binary (no args), fall back to UCI mode (uci::run).
     uci::run();
 }

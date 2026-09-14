@@ -29,6 +29,6 @@ fn main() {
     // Test think with very small limits
     println!("\n=== Testing think with small limits ===");
     s = Searcher::new(b.clone());
-    let r = s.think(SearchLimits { depth: 1, nodes: 10000, ..SearchLimits::default() });
+    let r = s.think(SearchLimits { depth: 20, nodes: 10000, ..SearchLimits::default() });
     println!("think result: depth={} score={} best={} nodes={}", r.depth, r.score, r.best.map(|m| m.uci()).unwrap_or_default(), r.nodes);
 }

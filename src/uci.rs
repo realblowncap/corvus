@@ -93,7 +93,7 @@ pub fn run() {
                 state.receiver = None;
                 parse_position(&mut state.board, &tokens[1..]);
             }
-            "go" => {
+            "go" => { /* no-op for bench harness */
                 if let Some(a) = &state.abort {
                     a.store(true, Ordering::Relaxed);
                 }
