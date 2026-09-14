@@ -1061,7 +1061,8 @@ mod tests {
     }
 
     #[test]
-    fn think_depth_12_completes() {
+    fn think_depth_12_completes_safe() {
+        // Safer regression: ensure depth-12 can complete and produce a best move, but avoid assertions that depend on exact PV or score
         let mut b = Board::startpos();
         let mut s = Searcher::new(b);
         let r = s.think(SearchLimits { depth: 12, ..SearchLimits::default() });
