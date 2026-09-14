@@ -393,15 +393,16 @@ impl Searcher {
             if !self.quiet {
                 outln(format!("info depth 1 score cp {} pv {}", sc, bm.uci()));
             }
-            return SearchResult {
-                best: Some(bm),
-                score: if self.board.side == BLACK { -sc } else { sc },
-                nodes: 0,
-                depth: 0,
-            };
+            // Don't return immediately - still do the search
+            // return SearchResult {
+            //     best: Some(bm),
+            //     score: if self.board.side == BLACK { -sc } else { sc },
+            //     nodes: 0,
+            //     depth: 0,
+            // };
         }
 
-let mut best: Option<Move> = None;
+        let mut best: Option<Move> = None;
         let mut score = 0i32;
         let mut last_depth = 0u32;
         let mut depth = 1usize;
@@ -450,17 +451,7 @@ let mut best: Option<Move> = None;
             };
             let pv = self.pv_line(depth);
             let pv_str: Vec<String> = pv.iter().map(|m| m.uci()).collect();
-            if !self.quiet {
-                outln(format!(
-                    "info depth {} {} nodes {} nps {} time {} pv {}",
-                    depth,
-                    score_string(score),
-                    self.nodes,
-                    nps,
-                    elapsed,
-                    pv_str.join(" ")
-                ));
-            }
+            println!("info depth {} {} nodes {} nps {} time {} pv {}", depth, score_string(score), self.nodes, nps, elapsed, pv_str.join(" "));
 
             if depth >= max_depth {
                 break;
