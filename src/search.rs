@@ -313,6 +313,13 @@ impl Searcher {
                             capture_score += 50; // Bonus for pawn captures
                         }
                         
+                        // Additional nuanced bonus: pawn-vs-pawn trades tend to simplify
+                        if piece_value == PIECE_VALUES[PAWN] && captured_value == PIECE_VALUES[PAWN] {
+                            capture_score += 20; // small bonus for pawn captures of pawns
+                        } else if piece_value == PIECE_VALUES[PAWN] {
+                            capture_score += 10; // modest bonus for pawn captures of non-pawn
+                        }
+                        
                         // Bonus for captures that also develop pieces
                         // Check if the move gets a piece to a better square
                         let center_squares = [0x3c, 0x3d, 0x3e, 0x3f, 0x4c, 0x4d, 0x4e, 0x4f,
@@ -438,6 +445,12 @@ impl Searcher {
             if self.stopped {
                 break;
             }
+            // Age history table to focus on recent search results
+            for side in 0..2 {
+                for h in self.history[side].iter_mut() {
+                    *h >>= 1;
+                }
+            }
             prev = sc;
             best = Some(mv);
             score = if self.board.side == BLACK { -sc } else { sc };
@@ -488,7 +501,7 @@ impl Searcher {
         }
     }
 
-    fn search_root(&mut self, depth: i32, mut alpha: i32, beta: i32) -> (Move, i32) {
+    pub fn search_root(&mut self, depth: i32, mut alpha: i32, beta: i32) -> (Move, i32) {
         let moves = generate_pseudo(&mut self.board);
         let tt_mov = self.tt.probe(self.board.key).map(|e| e.0);
         let ordered = self.order_moves(self.board.side, moves, tt_mov, 0, None);
