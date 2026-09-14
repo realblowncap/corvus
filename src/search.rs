@@ -595,9 +595,10 @@ let mut best: Option<Move> = None;
 
         let moves = generate_pseudo(&mut self.board);
 
-        if !in_check && alpha + 1 == beta && d <= 6 {
+        if !in_check && alpha + 1 == beta && d <= 10 {
             let stand = evaluate(&self.board);
-            if stand >= beta + 60 + 60 * d && stand < MATE - 500 && stand > -MATE + 500 {
+            let margin = 60 + 60 * d;
+            if stand >= beta + margin && stand < MATE - 500 && stand > -MATE + 500 {
                 return stand;
             }
         }
@@ -608,9 +609,9 @@ let mut best: Option<Move> = None;
         let prev_to = self.moves_made.last().map(|m| m.to);
         let ordered = self.order_moves(stm, moves, tt_mov, ply, prev_to);
 
-        if allow_null && depth >= 3 && !in_check && n >= 2 && self.has_null_material(stm) {
+        if allow_null && depth >= 2 && !in_check && n >= 2 && self.has_null_material(stm) {
             self.make_null();
-            let v = -self.negamax(depth - 3, -beta, -beta + 1, ply + 1, false);
+            let v = -self.negamax(depth - 4, -beta, -beta + 1, ply + 1, false);
             self.unmake_null();
             if self.stopped {
                 return 0;
@@ -628,16 +629,16 @@ let mut best: Option<Move> = None;
 
         let mut se_move: Option<u32> = None;
         let mut se_ext = 0i32;
-        if !in_check && depth >= 6 && ply >= 2 && n >= 2 {
+        if !in_check && depth >= 5 && ply >= 2 && n >= 2 {
             if let Some((tm, td, ts, tb)) = tt {
                 if tm != 0
-                    && td >= depth - 3
+                    && td >= depth - 4
                     && ts > -MATE && ts < MATE
                     && (tb == TT_BOUND_LOWER || tb == TT_BOUND_EXACT)
                 {
                     let stand = evaluate(&self.board);
-                    if stand >= beta - 3 {
-                        let margin = 40 + 6 * depth;
+                    if stand >= beta - 5 {
+                        let margin = 50 + 8 * depth;
                         let sbeta = ts - margin;
                         let mut found_other = false;
                         for &(om, _) in ordered.iter() {
@@ -660,7 +661,7 @@ let mut best: Option<Move> = None;
                         if !found_other {
                             se_move = Some(tm);
                             se_ext = 1;
-                            if ts >= beta + 80 {
+                            if ts >= beta + 100 {
                                 se_ext = 2;
                             }
                         }
@@ -690,16 +691,16 @@ let mut best: Option<Move> = None;
                 }
             }
             let mut reduction = 0i32;
-            if quiet && !in_check && d >= 3 && searched >= 4 && !mate_ctx {
+            if quiet && !in_check && d >= 2 && searched >= 3 && !mate_ctx {
                 let p = ply.min(MAX_PLY - 1);
                 let ks = m.from * 64 + m.to;
                 let good = m == self.killers[p][0]
                     || m == self.killers[p][1]
                     || self.history[stm][ks] > 1000;
                 if !good {
-                    reduction = 1 + (searched as i32 - 4) / 3 + (d - 3) / 4;
+                    reduction = 1 + (searched as i32 - 3) / 2 + (d - 2) / 3;
                     if self.gives_check(m) {
-                        reduction = 0;
+                        reduction = (reduction * 2) / 3; // Less reduction for checks
                     } else {
                         reduction = reduction.min(d - 1);
                     }
@@ -726,6 +727,16 @@ let mut best: Option<Move> = None;
             let mut fdepth = dd - 1 - reduction + extension;
             if fdepth < 0 {
                 fdepth = 0;
+            }
+            
+            // Aggressive futility pruning for quiet moves
+            if quiet && fdepth <= 4 && searched >= 2 {
+                if let Some(st) = stand {
+                    let margin = 120 + 40 * fdepth;
+                    if st + margin <= alpha && !self.gives_check(m) && !mate_ctx {
+                        continue;
+                    }
+                }
             }
             if !self.make(m) {
                 continue;
