@@ -654,15 +654,16 @@ pub fn evaluate(b: &Board) -> i32 {
         let king_file = file_of(king_sq);
         let king_rank = rank_of(king_sq);
         
-        // Check if there are pawns in front of the king that could be pushed
-        let pawn_rank = if c == WHITE { king_rank - 1 } else { king_rank + 1 };
-        
-        if pawn_rank < 8 && pawn_rank < 8 {
-            let pawn_mask = RANK_MASK[pawn_rank] & FILE_MASK[king_file];
+        // robust pawn-in-front-king check with safe bounds
+        let pawn_rank = if c == WHITE {
+            if king_rank == 0 { 0 } else { king_rank - 1 }
+        } else {
+            if king_rank >= 7 { 7 } else { king_rank + 1 }
+        };
+        if pawn_rank < 8 {
+            let pawn_mask = (RANK_MASK[pawn_rank] & FILE_MASK[king_file]);
             let pawns = b.pieces[c][PAWN] & pawn_mask;
-            
             if pawns != 0 {
-                // Penalty for having pawns in front of the king that could be pushed
                 score += if c == WHITE { -15 } else { 15 };
             }
         }
