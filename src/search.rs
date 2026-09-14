@@ -464,7 +464,9 @@ impl Searcher {
             };
             let pv = self.pv_line(depth);
             let pv_str: Vec<String> = pv.iter().map(|m| m.uci()).collect();
-            println!("info depth {} {} nodes {} nps {} time {} pv {}", depth, score_string(score), self.nodes, nps, elapsed, pv_str.join(" "));
+            if !self.quiet {
+                println!("info depth {} {} nodes {} nps {} time {} pv {}", depth, score_string(score), self.nodes, nps, elapsed, pv_str.join(" "));
+            }
 
             if depth >= max_depth {
                 break;
