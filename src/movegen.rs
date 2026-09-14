@@ -18,7 +18,8 @@ use crate::bitboard::*;
 use crate::board::*;
 use crate::eval::PIECE_VALUES;
 
-pub fn generate_legal(b: &mut Board) -> Vec<Move> {
+
+pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
     let mut moves = Vec::with_capacity(64);
     let us = b.side;
     let them = us ^ 1;
@@ -204,17 +205,23 @@ pub fn generate_legal(b: &mut Board) -> Vec<Move> {
         }
     }
 
-    moves.retain(|&m| {
-        let legal = b.make(m);
-        b.unmake(m);
-        legal
-    });
-
     moves
 }
 
+pub fn generate_legal(b: &mut Board) -> Vec<Move> {
+    let moves = generate_pseudo(b);
+    moves
+        .into_iter()
+        .filter(|&m| {
+            let legal = b.make(m);
+            b.unmake(m);
+            legal
+        })
+        .collect()
+}
+
 pub fn generate_captures(b: &mut Board) -> Vec<Move> {
-    generate_legal(b)
+    generate_pseudo(b)
         .into_iter()
         .filter(|m| m.captured != NO_PIECE || m.promo != NO_PIECE)
         .collect()

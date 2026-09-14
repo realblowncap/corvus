@@ -17,7 +17,7 @@
 use crate::bitboard::*;
 use crate::board::*;
 use crate::eval::{evaluate, MATE, PIECE_VALUES};
-use crate::movegen::{generate_captures, generate_legal};
+use crate::movegen::{generate_captures, generate_legal, generate_pseudo};
 use crate::uci::outln;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -133,8 +133,11 @@ pub struct Searcher {
     pub counter: [[u32; 64]; 2],
     pub moves_made: Vec<Move>,
     pub nodes: u64,
+
+
     pub stopped: bool,
     pub quiet: bool,
+    pub dbg_root: bool,
     pub abort: Arc<AtomicBool>,
     pub deadline: Option<Instant>,
     pub nodes_limit: u64,
@@ -153,8 +156,11 @@ impl Searcher {
             counter: [[0; 64]; 2],
             moves_made: Vec::new(),
             nodes: 0,
+            
+
             stopped: false,
             quiet: false,
+            dbg_root: false,
             abort: Arc::new(AtomicBool::new(false)),
             deadline: None,
             nodes_limit: u64::MAX,
@@ -186,12 +192,17 @@ impl Searcher {
         Some(Instant::now() + Duration::from_millis(budget))
     }
 
-    fn make(&mut self, m: Move) {
+    fn make(&mut self, m: Move) -> bool {
         let irr = m.piece == PAWN || m.captured != NO_PIECE;
-        self.board.make(m);
+        let legal = self.board.make(m);
+        if !legal {
+            self.board.unmake(m);
+            return false;
+        }
         self.key_stack.push(self.board.key);
         self.irr_boundary.push(irr);
         self.moves_made.push(m);
+        true
     }
 
     fn unmake(&mut self, m: Move) {
@@ -462,7 +473,7 @@ let mut best: Option<Move> = None;
     }
 
     fn search_root(&mut self, depth: i32, mut alpha: i32, beta: i32) -> (Move, i32) {
-        let moves = generate_legal(&mut self.board);
+        let moves = generate_pseudo(&mut self.board);
         let tt_mov = self.tt.probe(self.board.key).map(|e| e.0);
         let ordered = self.order_moves(self.board.side, moves, tt_mov, 0, None);
 
@@ -471,8 +482,12 @@ let mut best: Option<Move> = None;
         let mut fail_high = false;
 
         let mut first = true;
+        let mut legal_count = 0usize;
         for &(m, _) in ordered.iter() {
-            self.make(m);
+            if !self.make(m) {
+                continue;
+            }
+            legal_count += 1;
             if self.stopped {
                 self.unmake(m);
                 break;
@@ -487,6 +502,16 @@ let mut best: Option<Move> = None;
                 v
             };
             self.unmake(m);
+            if self.dbg_root && !self.stopped {
+                outln(format!(
+                    "rootdbg depth {} move {} window ({},{}) v {}",
+                    depth,
+                    m.uci(),
+                    alpha,
+                    beta,
+                    v
+                ));
+            }
             first = false;
             if self.stopped {
                 break;
@@ -503,6 +528,14 @@ let mut best: Option<Move> = None;
                 break;
             }
         }
+        if legal_count == 0 {
+            best_move = Move::normal(0, 0, 0, NO_PIECE);
+            best = if self.board.in_check(self.board.side) {
+                -MATE + 1
+            } else {
+                DRAW
+            };
+        }
         if !self.stopped {
             self.tt.store(
                 self.board.key,
@@ -517,6 +550,7 @@ let mut best: Option<Move> = None;
 
     fn negamax(&mut self, depth: i32, mut alpha: i32, beta: i32, ply: usize, allow_null: bool) -> i32 {
         self.nodes += 1;
+
         if self.nodes & 1023 == 0 {
             self.poll_stop();
         }
@@ -552,17 +586,14 @@ let mut best: Option<Move> = None;
             }
         }
 
-        let d = if in_check { depth + 1 } else { depth };
+        let d = if in_check && depth <= 6 { depth + 1 } else { depth };
         if d <= 0 {
             return self.quiescence(alpha, beta, ply);
         }
 
-        let dd = if depth >= 5 && tt.is_none() { d - 1 } else { d };
+        let dd = d;
 
-        let moves = generate_legal(&mut self.board);
-        if moves.is_empty() {
-            return if in_check { -(MATE - ply as i32) } else { DRAW };
-        }
+        let moves = generate_pseudo(&mut self.board);
 
         if !in_check && alpha + 1 == beta && d <= 6 {
             let stand = evaluate(&self.board);
@@ -591,8 +622,9 @@ let mut best: Option<Move> = None;
 
         let alpha0 = alpha;
         let mut best = -INF;
-        let mut best_move = ordered[0].0;
+        let mut best_move = Move::normal(0, 0, 0, NO_PIECE);
         let mut searched = 0usize;
+        let mut legal_count = 0usize;
 
         let mut se_move: Option<u32> = None;
         let mut se_ext = 0i32;
@@ -612,7 +644,9 @@ let mut best: Option<Move> = None;
                             if om.pack() == tm {
                                 continue;
                             }
-                            self.make(om);
+                            if !self.make(om) {
+                                continue;
+                            }
                             let v = -self.negamax(depth / 2, -sbeta, -sbeta + 1, ply + 1, true);
                             self.unmake(om);
                             if self.stopped {
@@ -656,14 +690,14 @@ let mut best: Option<Move> = None;
                 }
             }
             let mut reduction = 0i32;
-            if quiet && !in_check && d >= 5 && searched >= 6 && !mate_ctx {
+            if quiet && !in_check && d >= 3 && searched >= 4 && !mate_ctx {
                 let p = ply.min(MAX_PLY - 1);
                 let ks = m.from * 64 + m.to;
                 let good = m == self.killers[p][0]
                     || m == self.killers[p][1]
                     || self.history[stm][ks] > 1000;
                 if !good {
-                    reduction = ((searched as i32 - 5) / 3).min(3);
+                    reduction = 1 + (searched as i32 - 4) / 3 + (d - 3) / 4;
                     if self.gives_check(m) {
                         reduction = 0;
                     } else {
@@ -678,13 +712,14 @@ let mut best: Option<Move> = None;
                     extension = se_ext;
                 }
             }
-            if quiet
+            if false && quiet
                 && !in_check
                 && depth >= 6
                 && ply >= 1
                 && ply < 14
                 && extension == 0
                 && self.gives_check(m)
+                && self.see_move(m) <= 0
             {
                 extension = 1;
             }
@@ -692,7 +727,10 @@ let mut best: Option<Move> = None;
             if fdepth < 0 {
                 fdepth = 0;
             }
-            self.make(m);
+            if !self.make(m) {
+                continue;
+            }
+            legal_count += 1;
             if searched == 0 {
                 v = -self.negamax(fdepth, -beta, -alpha, ply + 1, true);
             } else {
@@ -725,6 +763,10 @@ let mut best: Option<Move> = None;
             }
         }
 
+        if legal_count == 0 {
+            return if in_check { -(MATE - ply as i32) } else { DRAW };
+        }
+
         let bound = if best <= alpha0 {
             TT_BOUND_UPPER
         } else if best >= beta {
@@ -740,6 +782,7 @@ let mut best: Option<Move> = None;
     }
 
     fn quiescence(&mut self, mut alpha: i32, beta: i32, ply: usize) -> i32 {
+
         if ply >= MAX_PLY {
             return evaluate(&self.board);
         }
@@ -764,9 +807,9 @@ let mut best: Option<Move> = None;
         }
 
         let (caps, checks): (Vec<Move>, Vec<Move>) = if in_check {
-            (generate_legal(&mut self.board), Vec::new())
+            (generate_pseudo(&mut self.board), Vec::new())
         } else if ply < 4 {
-            let all = generate_legal(&mut self.board);
+            let all = generate_pseudo(&mut self.board);
             let mut chks = Vec::new();
             for &m in all.iter() {
                 if m.captured == NO_PIECE && m.promo == NO_PIECE {
@@ -798,6 +841,7 @@ let mut best: Option<Move> = None;
             ordered.push((m, self.history[side][m.from * 64 + m.to] / 16));
         }
 
+        let mut legal_count = 0usize;
         for &(m, _) in ordered.iter() {
             if !in_check {
                 let cap_v = if m.captured != NO_PIECE && m.promo == NO_PIECE {
@@ -820,7 +864,10 @@ let mut best: Option<Move> = None;
                     }
                 }
             }
-            self.make(m);
+            if !self.make(m) {
+                continue;
+            }
+            legal_count += 1;
             let v = -self.quiescence(-beta, -alpha, ply + 1);
             self.unmake(m);
             if self.stopped {
@@ -833,6 +880,9 @@ let mut best: Option<Move> = None;
                 alpha = v;
             }
         }
+        if legal_count == 0 {
+            return if in_check { -(MATE - ply as i32) } else { alpha };
+        }
         alpha
     }
 
@@ -843,10 +893,21 @@ let mut best: Option<Move> = None;
     }
 
     fn gives_check(&mut self, m: Move) -> bool {
-        self.make(m);
+        if !self.make(m) {
+            return false;
+        }
         let c = self.board.in_check(self.board.side);
         self.unmake(m);
         c
+    }
+
+    fn see_move(&mut self, m: Move) -> i32 {
+        if !self.make(m) {
+            return 0;
+        }
+        let v = crate::movegen::see(&self.board, m.to, self.board.side);
+        self.unmake(m);
+        v
     }
 
     fn pv_line(&mut self, max: usize) -> Vec<Move> {
@@ -870,7 +931,9 @@ let mut best: Option<Move> = None;
             };
             match tm {
                 Some(m) => {
-                    self.make(m);
+                    if !self.make(m) {
+                        break;
+                    }
                     out.push(m);
                     made.push(m);
                 }
