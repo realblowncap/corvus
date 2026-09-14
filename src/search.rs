@@ -301,7 +301,32 @@ impl Searcher {
                         s += 30_000;
                     }
                     if m.captured != NO_PIECE {
-                        s += 10 * PIECE_VALUES[m.captured] - PIECE_VALUES[m.piece];
+                        // Prefer pawn captures over higher-value pieces
+                        let piece_value = PIECE_VALUES[m.piece];
+                        let captured_value = PIECE_VALUES[m.captured];
+                        
+                        // Base score for capture (MVV-LVA style)
+                        let mut capture_score = 10 * captured_value - piece_value;
+                        
+                        // Bonus for pawn captures (prefer lower-value pieces)
+                        if piece_value == PIECE_VALUES[PAWN] {
+                            capture_score += 50; // Bonus for pawn captures
+                        }
+                        
+                        // Bonus for captures that also develop pieces
+                        // Check if the move gets a piece to a better square
+                        let center_squares = [0x3c, 0x3d, 0x3e, 0x3f, 0x4c, 0x4d, 0x4e, 0x4f,
+                                           0x5c, 0x5d, 0x5e, 0x5f, 0x6c, 0x6d, 0x6e, 0x6f];
+                        if center_squares.contains(&m.to) {
+                            capture_score += 30; // Bonus for developing to center
+                        }
+                        
+                        // Penalty for rook captures unless it's a high-value capture
+                        if piece_value == PIECE_VALUES[ROOK] && captured_value < PIECE_VALUES[QUEEN] {
+                            capture_score -= 20;
+                        }
+                        
+                        s += capture_score;
                     }
                 } else if self.killers[p][0] == m {
                     s += 910_000;
@@ -493,11 +518,11 @@ let mut best: Option<Move> = None;
                 break;
             }
             let v = if first {
-                -self.negamax(depth - 1, -beta, -alpha, 1, true)
+                -self.negamax(depth, -beta, -alpha, 1, true)
             } else {
-                let mut v = -self.negamax(depth - 1, -alpha - 1, -alpha, 1, true);
+                let mut v = -self.negamax(depth, -alpha - 1, -alpha, 1, true);
                 if v > alpha && v < beta {
-                    v = -self.negamax(depth - 1, -beta, -alpha, 1, true);
+                    v = -self.negamax(depth, -beta, -alpha, 1, true);
                 }
                 v
             };
