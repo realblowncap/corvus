@@ -950,7 +950,7 @@ impl Searcher {
         v
     }
 
-    pub fn pv_line(&mut self, max: usize) -> Vec<Move> {
+    pub pub fn pv_line(&mut self, max: usize) -> Vec<Move> {
         let mut out = Vec::new();
         let mut made = Vec::new();
         for _ in 0..max {
