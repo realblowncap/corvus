@@ -433,6 +433,15 @@ pub fn evaluate(b: &Board) -> i32 {
         let home_rank = if c == WHITE { 0 } else { 7 };
         if midgame && kr as i32 != home_rank {
             side -= KING_EXPOSED;
+            // Additional penalty for king exposure in open positions
+            let open_files = (0..8).filter(|&f| {
+                let file_mask = FILE_MASK[f];
+                let pawns_in_file = (b.pieces[0][PAWN] | b.pieces[1][PAWN]) & file_mask;
+                pawns_in_file == 0
+            }).count() as i32;
+            if open_files >= 3 {
+                side -= KING_EXPOSED / 2;
+            }
         }
 
         let enemy_half = if c == WHITE {
@@ -553,9 +562,9 @@ pub fn evaluate(b: &Board) -> i32 {
                 }
                 let defended = attacked_by[c] & bit(sq) != 0;
                 pen += if defended {
-                    PIECE_VALUES[pc] / 12
+                    PIECE_VALUES[pc] / 10  // Reduced penalty for defended pieces
                 } else {
-                    PIECE_VALUES[pc] / 2
+                    PIECE_VALUES[pc] / 2 + PIECE_VALUES[pc] / 4  // Increased penalty for undefended
                 };
             }
         }
@@ -565,7 +574,7 @@ pub fn evaluate(b: &Board) -> i32 {
     for c in 0..2 {
         let cover = king_cover[c].count_ones() as i32;
         let force = atk_force[c];
-        if force < 50 || cover < 2 || atk_pieces[c] < 2 {
+        if force < 30 || cover < 2 || atk_pieces[c] < 2 {
             continue;
         }
         let (kf, kr) = (file_of(b.kingsq[c]), rank_of(b.kingsq[c]));
@@ -638,6 +647,27 @@ pub fn evaluate(b: &Board) -> i32 {
     let cd = ((file_of(b.kingsq[0]) as i32 - file_of(b.kingsq[1]) as i32).abs())
             .max((rank_of(b.kingsq[0]) as i32 - rank_of(b.kingsq[1]) as i32).abs());
     score += (7 - cd) * KING_PROX * p / 24;
+
+    // Additional penalty for pawn pushes that expose the king
+    for c in 0..2 {
+        let king_sq = b.kingsq[c];
+        let king_file = file_of(king_sq);
+        let king_rank = rank_of(king_sq);
+        
+        // Check if there are pawns in front of the king that could be pushed
+        let pawn_direction = if c == WHITE { 1 } else { -1 };
+        let pawn_rank = if c == WHITE { king_rank - 1 } else { king_rank + 1 };
+        
+        if pawn_rank < 8 && pawn_rank < 8 {
+            let pawn_mask = RANK_MASK[pawn_rank] & FILE_MASK[king_file];
+            let pawns = b.pieces[c][PAWN] & pawn_mask;
+            
+            if pawns != 0 {
+                // Penalty for having pawns in front of the king that could be pushed
+                score += if c == WHITE { -15 } else { 15 };
+            }
+        }
+    }
 
     if b.pieces[0][QUEEN] == 0 && b.pieces[1][QUEEN] == 0 {
         let color_of_sq = |sq: usize| (file_of(sq) + rank_of(sq)) & 1;
