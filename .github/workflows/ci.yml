@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          components: ["rustfmt", "clippy"]
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            /home/runner/.cargo/registry
+            /home/runner/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build and run depth-20 sanity
+        run: |
+          cargo test --test depth20_sanity
+
+      - name: Run full test suite
+        run: |
+          cargo test --all
