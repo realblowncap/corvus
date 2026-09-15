@@ -159,7 +159,7 @@ impl Searcher {
     pub fn new(board: Board) -> Searcher {
         Searcher {
             board,
-            tt: TT::new(20),
+            tt: TT::new(24),
             killers: [[Move::normal(0, 0, 0, NO_PIECE); 2]; MAX_PLY],
             history: [[0; 4096]; 2],
             counter: [[0; 64]; 2],
@@ -318,45 +318,17 @@ impl Searcher {
                         s += 1_000_000;
                     }
                 }
-                if m.captured != NO_PIECE || m.promo != NO_PIECE {
-                    s += 930_000;
-                    if m.promo != NO_PIECE {
-                        s += 30_000;
-                    }
-                    if m.captured != NO_PIECE {
-                        // Prefer pawn captures over higher-value pieces
-                        let piece_value = PIECE_VALUES[m.piece];
-                        let captured_value = PIECE_VALUES[m.captured];
-                        
-                        // Base score for capture (MVV-LVA style)
-                        let mut capture_score = 10 * captured_value - piece_value;
-                        
-                        // Bonus for pawn captures (prefer lower-value pieces)
-                        if piece_value == PIECE_VALUES[PAWN] {
-                            capture_score += 50; // Bonus for pawn captures
-                        }
-                        
-                        // Additional nuanced bonus: pawn-vs-pawn trades tend to simplify
-                        if piece_value == PIECE_VALUES[PAWN] && captured_value == PIECE_VALUES[PAWN] {
-                            capture_score += 20; // small bonus for pawn captures of pawns
-                        } else if piece_value == PIECE_VALUES[PAWN] {
-                            capture_score += 10; // modest bonus for pawn captures of non-pawn
-                        }
-                        
-                        // Bonus for captures that also develop pieces
-                        // Check if the move gets a piece to a better square
-                        let center_squares = [0x3c, 0x3d, 0x3e, 0x3f, 0x4c, 0x4d, 0x4e, 0x4f,
-                                           0x5c, 0x5d, 0x5e, 0x5f, 0x6c, 0x6d, 0x6e, 0x6f];
-                        if center_squares.contains(&m.to) {
-                            capture_score += 30; // Bonus for developing to center
-                        }
-                        
-                        // Penalty for rook captures unless it's a high-value capture
-                        if piece_value == PIECE_VALUES[ROOK] && captured_value < PIECE_VALUES[QUEEN] {
-                            capture_score -= 20;
-                        }
-                        
-                        s += capture_score;
+                if m.promo != NO_PIECE {
+                    // Queen promotions are always valued highly
+                    s += 960_000 + PIECE_VALUES[m.promo];
+                } else if m.captured != NO_PIECE {
+                    let see_val = crate::movegen::see(&self.board, m.to, self.board.side);
+                    if see_val >= 0 {
+                        // Good captures: above killers, scored by SEE
+                        s += 930_000 + see_val;
+                    } else {
+                        // Losing captures: below killers, below quiets
+                        s += see_val;
                     }
                 } else if self.killers[p][0] == m {
                     s += 910_000;
@@ -644,6 +616,7 @@ impl Searcher {
         let key = self.board.key;
 
         let tt = self.tt.probe(key);
+        let tt_mov = tt.map(|e| e.0);
         let mate_ctx = tt.map_or(false, |(_tm, _td, ts, _tb)| {
             ts.abs() >= MATE - 2 * MAX_PLY as i32
         });
@@ -662,7 +635,16 @@ impl Searcher {
             }
         }
 
-        let d = if in_check && depth <= 6 { depth + 1 } else { depth };
+        // Internal Iterative Reduction: when no TT move is available at depth >= 4,
+        // reduce by 1 to speed up the search since we lack move ordering information.
+        let mut d = depth;
+        if tt_mov.is_none() && d >= 4 {
+            d -= 1;
+        }
+        // Check extension: extend when in check at low depth to avoid horizon effect
+        if in_check && d <= 6 {
+            d += 1;
+        }
         if d <= 0 {
             return self.quiescence(alpha, beta, ply);
         }
@@ -679,8 +661,19 @@ impl Searcher {
             }
         }
 
+        // Razoring: at low depth if eval is far below alpha, the position is
+        // likely hopeless — drop into qsearch to confirm and prune.
+        if !in_check && d <= 3 && !mate_ctx {
+            let margin = 200 + 150 * d;
+            if self.eval_now() + margin <= alpha {
+                let v = self.quiescence(alpha, beta, ply);
+                if v <= alpha {
+                    return v;
+                }
+            }
+        }
+
         let stm = self.board.side;
-        let tt_mov = tt.map(|e| e.0);
         let n = moves.len();
         let prev_to = self.moves_made.last().map(|m| m.to);
         let ordered = self.order_moves(stm, moves, tt_mov, ply, prev_to);
@@ -766,6 +759,19 @@ impl Searcher {
                     }
                 }
             }
+
+            // Late Move Pruning: after many moves at shallow depth, quiet moves
+            // are unlikely to beat alpha — skip unless they give check or are
+            // the singular-extension move.
+            if quiet && !in_check && d <= 5 && searched >= (3 + d * d) as usize && !mate_ctx {
+                let is_se = match se_move {
+                    Some(sm) => m.pack() == sm,
+                    None => false,
+                };
+                if !is_se && !self.gives_check(m) {
+                    continue;
+                }
+            }
             let mut reduction = 0i32;
             if quiet && !in_check && d >= 2 && searched >= 3 && !mate_ctx {
                 let p = ply.min(MAX_PLY - 1);
@@ -775,11 +781,14 @@ impl Searcher {
                     || self.history[stm][ks] > 1000;
                 if !good {
                     reduction = 1 + (searched as i32 - 3) / 2 + (d - 2) / 3;
+                    if alpha + 1 < beta {
+                        // PV node: reduce less to avoid missing the PV
+                        reduction = reduction * 2 / 3;
+                    }
                     if self.gives_check(m) {
                         reduction = (reduction * 2) / 3; // Less reduction for checks
-                    } else {
-                        reduction = reduction.min(d - 1);
                     }
+                    reduction = reduction.min(d - 1);
                 }
             }
             let mut v;
@@ -789,7 +798,7 @@ impl Searcher {
                     extension = se_ext;
                 }
             }
-            if false && quiet
+            if quiet
                 && !in_check
                 && d >= 6
                 && ply >= 1
@@ -1099,7 +1108,7 @@ mod tests {
     #[test]
     fn think_depth_12_completes_safe() {
         // Safer regression: ensure depth-12 can complete and produce a best move, but avoid assertions that depend on exact PV or score
-        let mut b = Board::startpos();
+        let b = Board::startpos();
         let mut s = Searcher::new(b);
         let r = s.think(SearchLimits { depth: 12, ..SearchLimits::default() });
         assert!(r.depth >= 12, "expected depth >= 12, got {}", r.depth);
@@ -1109,7 +1118,7 @@ mod tests {
 
     #[test]
     fn think_depth_12_pv_line_computable() {
-        let mut b = Board::startpos();
+        let b = Board::startpos();
         let mut s = Searcher::new(b);
         let _ = s.think(SearchLimits { depth: 12, ..SearchLimits::default() });
         let pv = s.pv_line(2);
