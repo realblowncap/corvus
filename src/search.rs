@@ -83,6 +83,13 @@ impl TT {
             return;
         }
         let idx = (key as usize) & self.mask;
+        let e = &self.entries[idx];
+        // Depth-preferred replacement: keep strictly deeper entries so that a
+        // shallow search later in the tree cannot evict deeper information.
+        let old_depth = ((e.data >> 26) & 0xFF) as i32;
+        if e.key != 0 && old_depth > depth {
+            return;
+        }
         self.entries[idx] = TTEntry {
             key,
             data: pack_data(mov, bound, depth, score),
@@ -144,6 +151,8 @@ pub struct Searcher {
     pub key_stack: Vec<u64>,
     pub irr_boundary: Vec<bool>,
     pub null_ep: Vec<Option<usize>>,
+    pub eval_cache_key: u64,
+    pub eval_cache_val: i32,
 }
 
 impl Searcher {
@@ -167,7 +176,21 @@ impl Searcher {
             key_stack: Vec::new(),
             irr_boundary: Vec::new(),
             null_ep: Vec::new(),
+            eval_cache_key: u64::MAX,
+            eval_cache_val: 0,
         }
+    }
+
+    /// Evaluate the current position, memoizing the result per zobrist key so
+    /// that repeated static-eval calls at the same node are computed once.
+    fn eval_now(&mut self) -> i32 {
+        if self.eval_cache_key == self.board.key {
+            return self.eval_cache_val;
+        }
+        let v = evaluate(&self.board);
+        self.eval_cache_key = self.board.key;
+        self.eval_cache_val = v;
+        v
     }
 
     fn deadline(limits: &SearchLimits, side: usize) -> Option<Instant> {
@@ -504,6 +527,7 @@ impl Searcher {
     }
 
     pub fn search_root(&mut self, depth: i32, mut alpha: i32, beta: i32) -> (Move, i32) {
+        let alpha0 = alpha;
         let moves = generate_pseudo(&mut self.board);
         let tt_mov = self.tt.probe(self.board.key).map(|e| e.0);
         let ordered = self.order_moves(self.board.side, moves, tt_mov, 0, None);
@@ -568,18 +592,25 @@ impl Searcher {
             };
         }
         if !self.stopped {
+            let bound = if fail_high {
+                TT_BOUND_LOWER
+            } else if best <= alpha0 {
+                TT_BOUND_UPPER
+            } else {
+                TT_BOUND_EXACT
+            };
             self.tt.store(
                 self.board.key,
                 best_move.pack(),
                 depth,
                 probe_score(best, 0),
-                if fail_high { TT_BOUND_LOWER } else { TT_BOUND_EXACT },
+                bound,
             );
         }
         (best_move, best)
     }
 
-    fn negamax(&mut self, depth: i32, mut alpha: i32, beta: i32, ply: usize, allow_null: bool) -> i32 {
+    fn negamax(&mut self, depth: i32, mut alpha: i32, mut beta: i32, ply: usize, allow_null: bool) -> i32 {
         self.nodes += 1;
 
         if self.nodes & 1023 == 0 {
@@ -593,6 +624,20 @@ impl Searcher {
             if self.board.half >= 100 || self.rep_occurred() {
                 return DRAW;
             }
+        }
+
+        // Mate distance pruning: you can't be mated in fewer than ply+1 plies,
+        // and you can't mate later opposite side in fewer, so clamp the window.
+        let low = -(MATE - ply as i32 - 1);
+        let high = MATE - ply as i32 - 1;
+        if alpha < low {
+            alpha = low;
+        }
+        if beta > high {
+            beta = high;
+        }
+        if alpha >= beta {
+            return alpha;
         }
 
         let in_check = self.board.in_check(self.board.side);
@@ -627,7 +672,7 @@ impl Searcher {
         let moves = generate_pseudo(&mut self.board);
 
         if !in_check && alpha + 1 == beta && d <= 10 {
-            let stand = evaluate(&self.board);
+            let stand = self.eval_now();
             let margin = 60 + 60 * d;
             if stand >= beta + margin && stand < MATE - 500 && stand > -MATE + 500 {
                 return stand;
@@ -667,7 +712,7 @@ impl Searcher {
                     && ts > -MATE && ts < MATE
                     && (tb == TT_BOUND_LOWER || tb == TT_BOUND_EXACT)
                 {
-                    let stand = evaluate(&self.board);
+                    let stand = self.eval_now();
                     if stand >= beta - 5 {
                         let margin = 50 + 8 * depth;
                         let sbeta = ts - margin;
@@ -702,7 +747,7 @@ impl Searcher {
         }
 
         let stand = if !in_check && d <= 3 {
-            Some(evaluate(&self.board))
+            Some(self.eval_now())
         } else {
             None
         };
@@ -746,12 +791,11 @@ impl Searcher {
             }
             if false && quiet
                 && !in_check
-                && depth >= 6
+                && d >= 6
                 && ply >= 1
                 && ply < 14
                 && extension == 0
                 && self.gives_check(m)
-                && self.see_move(m) <= 0
             {
                 extension = 1;
             }
@@ -824,7 +868,6 @@ impl Searcher {
     }
 
     fn quiescence(&mut self, mut alpha: i32, beta: i32, ply: usize) -> i32 {
-
         if ply >= MAX_PLY {
             return evaluate(&self.board);
         }
@@ -838,7 +881,7 @@ impl Searcher {
 
         let in_check = self.board.in_check(self.board.side);
 
-        let stand = evaluate(&self.board);
+        let stand = self.eval_now();
         if !in_check {
             if stand >= beta {
                 return stand;
@@ -941,15 +984,6 @@ impl Searcher {
         let c = self.board.in_check(self.board.side);
         self.unmake(m);
         c
-    }
-
-    fn see_move(&mut self, m: Move) -> i32 {
-        if !self.make(m) {
-            return 0;
-        }
-        let v = crate::movegen::see(&self.board, m.to, self.board.side);
-        self.unmake(m);
-        v
     }
 
     pub fn pv_line(&mut self, max: usize) -> Vec<Move> {

@@ -661,7 +661,7 @@ pub fn evaluate(b: &Board) -> i32 {
             if king_rank >= 7 { 7 } else { king_rank + 1 }
         };
         if pawn_rank < 8 {
-            let pawn_mask = (RANK_MASK[pawn_rank] & FILE_MASK[king_file]);
+            let pawn_mask = RANK_MASK[pawn_rank] & FILE_MASK[king_file];
             let pawns = b.pieces[c][PAWN] & pawn_mask;
             if pawns != 0 {
                 score += if c == WHITE { -15 } else { 15 };
