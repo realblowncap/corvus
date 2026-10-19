@@ -16,7 +16,7 @@
 
 use crate::board::*;
 use crate::bitboard::*;
-use crate::movegen::generate_legal;
+use crate::movegen::{generate_legal, MoveList};
 
 fn piece_from_char(c: char) -> Option<usize> {
     match c {
@@ -45,14 +45,16 @@ pub fn san_to_move(board: &mut Board, san: &str) -> Option<Move> {
         s = &s[..s.len() - 1];
     }
 
-    let legal = generate_legal(board);
+    let mut legal = MoveList::new();
+    generate_legal(board, &mut legal);
+    let slice = legal.as_slice();
 
     let lower = s.to_ascii_lowercase();
     if lower == "o-o" || lower == "0-0" {
-        return castle_move(&legal, true);
+        return castle_move(slice, true);
     }
     if lower == "o-o-o" || lower == "0-0-0" {
-        return castle_move(&legal, false);
+        return castle_move(slice, false);
     }
 
     let mut body = s;
@@ -102,7 +104,7 @@ pub fn san_to_move(board: &mut Board, san: &str) -> Option<Move> {
     }
 
     let mut found: Option<Move> = None;
-    for m in legal {
+    for &m in legal.iter() {
         if m.piece != piece || m.to != to || m.promo != promo {
             continue;
         }

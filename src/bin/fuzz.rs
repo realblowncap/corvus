@@ -1,5 +1,5 @@
 use chess_engine::board::*;
-use chess_engine::movegen::generate_legal;
+use chess_engine::movegen::{generate_legal, MoveList};
 
 fn main() {
     let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
@@ -12,7 +12,8 @@ fn main() {
         let mut b = Board::startpos();
         let mut plies = 0;
         loop {
-            let a = generate_legal(&mut b);
+            let mut a = MoveList::new();
+            generate_legal(&mut b, &mut a);
             let r = reference::ref_legal_pub(&mut b);
 
             let sa = a.iter().map(|m| m.uci()).collect::<Vec<String>>();
@@ -40,7 +41,7 @@ fn main() {
             if a.is_empty() {
                 break;
             }
-            let m = a[rng(a.len())];
+            let m = a.as_slice()[rng(a.len)];
             let _ = b.make(m);
             plies += 1;
             if plies >= 60 {

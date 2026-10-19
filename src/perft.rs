@@ -21,12 +21,13 @@ pub fn perft(b: &mut Board, depth: u32) -> u64 {
     if depth == 0 {
         return 1;
     }
-    let moves = generate_legal(b);
+    let mut list = MoveList::new();
+    generate_legal(b, &mut list);
     if depth == 1 {
-        return moves.len() as u64;
+        return list.len as u64;
     }
     let mut total = 0u64;
-    for m in moves {
+    for &m in list.iter() {
         let _ = b.make(m);
         total += perft(b, depth - 1);
         b.unmake(m);
@@ -35,9 +36,10 @@ pub fn perft(b: &mut Board, depth: u32) -> u64 {
 }
 
 pub fn divide(b: &mut Board, depth: u32) {
-    let moves = generate_legal(b);
+    let mut list = MoveList::new();
+    generate_legal(b, &mut list);
     let mut total = 0u64;
-    for m in moves {
+    for &m in list.iter() {
         let _ = b.make(m);
         let c = if depth == 1 { 1 } else { perft(b, depth - 1) };
         b.unmake(m);

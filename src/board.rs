@@ -15,8 +15,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::bitboard::*;
+use crate::eval::pp_value;
 
 pub const NO_PIECE: usize = 6;
+
+/// Mailbox empty-slot marker. Occupied slots encode `(color << 3) | piece`.
+pub const EMPTY_SQ: u8 = 0xFF;
 
 pub const M_NORMAL: u8 = 0;
 pub const M_CASTLE: u8 = 1;
@@ -184,6 +188,7 @@ pub struct Undo {
     pub key: u64,
     pub cap_pt: usize,
     pub cap_sq: usize,
+    pub pst: i32,
 }
 
 #[derive(Clone)]
@@ -198,7 +203,17 @@ pub struct Board {
     pub half: u32,
     pub fullmove: u32,
     pub key: u64,
+    // Incremental material + midgame piece-square score from white's
+    // perspective (positive = white is better).  Maintained in make/unmake.
+    pub pst: i32,
     pub history: Vec<Undo>,
+    /// O(1) piece lookup: `(color << 3) | piece`, or `EMPTY_SQ`.
+    pub mailbox: [u8; 64],
+}
+
+#[inline]
+fn mailbox_code(c: usize, pc: usize) -> u8 {
+    ((c << 3) | pc) as u8
 }
 
 impl Board {
@@ -214,7 +229,9 @@ impl Board {
             half: 0,
             fullmove: 1,
             key: 0,
+            pst: 0,
             history: Vec::new(),
+            mailbox: [EMPTY_SQ; 64],
         }
     }
 
@@ -258,6 +275,7 @@ impl Board {
                     b.pieces[color][piece] |= bit(sq);
                     b.occ[color] |= bit(sq);
                     b.all |= bit(sq);
+                    b.mailbox[sq] = mailbox_code(color, piece);
                     file += 1;
                 }
             }
@@ -323,7 +341,23 @@ impl Board {
         }
 
         b.key = b.compute_key();
+        b.pst = b.compute_pst();
         Ok(b)
+    }
+
+    fn compute_pst(&self) -> i32 {
+        let mut p = 0i32;
+        for c in 0..2 {
+            for pc in 0..6 {
+                let mut bb = self.pieces[c][pc];
+                while bb != 0 {
+                    let sq = bb.trailing_zeros() as usize;
+                    bb &= bb - 1;
+                    p += pp_value(c, pc, sq);
+                }
+            }
+        }
+        p
     }
 
     pub fn compute_key(&self) -> u64 {
@@ -349,27 +383,36 @@ impl Board {
     }
 
     pub fn piece_on(&self, sq: usize) -> usize {
-        for c in 0..2 {
-            for pc in 0..6 {
-                if self.pieces[c][pc] & bit(sq) != 0 {
-                    return pc;
-                }
-            }
+        let m = self.mailbox[sq];
+        if m == EMPTY_SQ {
+            NO_PIECE
+        } else {
+            (m & 7) as usize
         }
-        NO_PIECE
     }
 
     pub fn color_on(&self, sq: usize) -> Option<usize> {
-        if self.occ[WHITE] & bit(sq) != 0 {
-            Some(WHITE)
-        } else if self.occ[BLACK] & bit(sq) != 0 {
-            Some(BLACK)
-        } else {
+        let m = self.mailbox[sq];
+        if m == EMPTY_SQ {
             None
+        } else {
+            Some((m >> 3) as usize)
         }
     }
 
     pub fn make(&mut self, m: Move) -> bool {
+        self.make_impl(m, false)
+    }
+
+    /// Like `make`, but the caller guarantees `was_in_check` describes whether
+    /// the mover's king was attacked before the move (the search already
+    /// computes this per node).  When it was not in check and the move cannot
+    /// expose the king, the post-move attacked() scan is skipped.
+    pub fn make_checked(&mut self, m: Move, was_in_check: bool) -> bool {
+        self.make_impl(m, !was_in_check)
+    }
+
+    fn make_impl(&mut self, m: Move, skip_ok: bool) -> bool {
         let us = self.side;
         let them = us ^ 1;
         let from = m.from;
@@ -384,12 +427,14 @@ impl Board {
             key: self.key,
             cap_pt: NO_PIECE,
             cap_sq: to,
+            pst: self.pst,
         });
 
         self.key ^= piece_key(from, us, pt);
         self.pieces[us][pt] &= !bit(from);
         self.occ[us] &= !bit(from);
         self.all &= !bit(from);
+        self.mailbox[from] = EMPTY_SQ;
 
         let mut cap_pt = NO_PIECE;
         let mut cap_sq = to;
@@ -412,6 +457,8 @@ impl Board {
             self.pieces[them][cap_pt] &= !bit(cap_sq);
             self.occ[them] &= !bit(cap_sq);
             self.all &= !bit(cap_sq);
+            self.mailbox[cap_sq] = EMPTY_SQ;
+            self.pst -= pp_value(them, cap_pt, cap_sq);
         }
 
         if m.flags & M_CASTLE != 0 {
@@ -421,6 +468,9 @@ impl Board {
             self.pieces[us][ROOK] = (self.pieces[us][ROOK] & !bit(rk_f)) | bit(rk_t);
             self.occ[us] = (self.occ[us] & !bit(rk_f)) | bit(rk_t);
             self.all = (self.all & !bit(rk_f)) | bit(rk_t);
+            self.mailbox[rk_f] = EMPTY_SQ;
+            self.mailbox[rk_t] = mailbox_code(us, ROOK);
+            self.pst += pp_value(us, ROOK, rk_t) - pp_value(us, ROOK, rk_f);
         }
 
         let place = if m.flags & M_PROMO != 0 { m.promo } else { pt };
@@ -428,6 +478,8 @@ impl Board {
         self.pieces[us][place] |= bit(to);
         self.occ[us] |= bit(to);
         self.all |= bit(to);
+        self.mailbox[to] = mailbox_code(us, place);
+        self.pst += pp_value(us, place, to) - pp_value(us, pt, from);
 
         if pt == KING {
             self.kingsq[us] = to;
@@ -497,7 +549,26 @@ impl Board {
         self.side = them;
         self.key ^= side_key();
 
-        !self.attacked(them, self.kingsq[us])
+        // Legality: the mover's king must not be attacked afterwards.  The scan can
+        // be skipped only when the mover was provably not in check, the move is
+        // not a king/EP move, and it cannot newly expose the king (vacating a
+        // king ray while the destination is off that same ray is the only
+        // possibility).  In all other cases run the full attacked() scan.
+        let k = self.kingsq[us];
+        let needs_scan = !skip_ok
+            || pt == KING
+            || m.flags & M_EP != 0
+            || {
+                let mut expose = false;
+                for d in 0..8 {
+                    if RAY[k][d] & bit(from) != 0 && RAY[k][d] & bit(to) == 0 {
+                        expose = true;
+                        break;
+                    }
+                }
+                expose
+            };
+        !needs_scan || !self.attacked(them, k)
     }
 
     pub fn unmake(&mut self, m: Move) {
@@ -512,17 +583,21 @@ impl Board {
         self.ep = undo.ep;
         self.half = undo.half;
         self.fullmove = undo.fullmove;
+        self.pst = undo.pst;
 
         let place = if m.flags & M_PROMO != 0 { m.promo } else { pt };
         self.pieces[us][place] &= !bit(to);
         self.occ[us] &= !bit(to);
         self.all &= !bit(to);
+        self.mailbox[to] = EMPTY_SQ;
 
         if m.flags & M_CASTLE != 0 {
             let (rk_f, rk_t) = if from < to { (from + 3, to - 1) } else { (from - 4, to + 1) };
             self.pieces[us][ROOK] = (self.pieces[us][ROOK] & !bit(rk_t)) | bit(rk_f);
             self.occ[us] = (self.occ[us] & !bit(rk_t)) | bit(rk_f);
             self.all = (self.all & !bit(rk_t)) | bit(rk_f);
+            self.mailbox[rk_f] = mailbox_code(us, ROOK);
+            self.mailbox[rk_t] = EMPTY_SQ;
         }
 
         if undo.cap_pt != NO_PIECE {
@@ -530,11 +605,13 @@ impl Board {
             self.pieces[them][undo.cap_pt] |= bit(undo.cap_sq);
             self.occ[them] |= bit(undo.cap_sq);
             self.all |= bit(undo.cap_sq);
+            self.mailbox[undo.cap_sq] = mailbox_code(them, undo.cap_pt);
         }
 
         self.pieces[us][pt] |= bit(from);
         self.occ[us] |= bit(from);
         self.all |= bit(from);
+        self.mailbox[from] = mailbox_code(us, pt);
 
         if pt == KING {
             self.kingsq[us] = from;
@@ -555,11 +632,56 @@ impl Board {
         }
         let rooks = self.pieces[by][ROOK] | self.pieces[by][QUEEN];
         let bishops = self.pieces[by][BISHOP] | self.pieces[by][QUEEN];
-        if rooks & rook_attacks(self.all, sq) != 0 {
-            return true;
+        if rooks != 0 {
+            // The only pieces that can attack `sq` along a rook ray are those
+            // sitting on the first occupied square of that ray. Checking each
+            // first blocker directly avoids a full magic-table (L2) probe on
+            // this hot path; each direction is unrolled so there are no
+            // iteration or indexing costs.
+            let occ = self.all;
+            let blockers = RAY[sq][0] & occ; // N
+            if blockers != 0 {
+                let first = blockers & blockers.wrapping_neg();
+                if rooks & first != 0 { return true; }
+            }
+            let blockers = RAY[sq][2] & occ; // E
+            if blockers != 0 {
+                let first = blockers & blockers.wrapping_neg();
+                if rooks & first != 0 { return true; }
+            }
+            let blockers = RAY[sq][4] & occ; // S
+            if blockers != 0 {
+                let last = 1u64 << (63 - blockers.leading_zeros());
+                if rooks & last != 0 { return true; }
+            }
+            let blockers = RAY[sq][6] & occ; // W
+            if blockers != 0 {
+                let last = 1u64 << (63 - blockers.leading_zeros());
+                if rooks & last != 0 { return true; }
+            }
         }
-        if bishops & bishop_attacks(self.all, sq) != 0 {
-            return true;
+        if bishops != 0 {
+            let occ = self.all;
+            let blockers = RAY[sq][1] & occ; // NE
+            if blockers != 0 {
+                let first = blockers & blockers.wrapping_neg();
+                if bishops & first != 0 { return true; }
+            }
+            let blockers = RAY[sq][3] & occ; // SE
+            if blockers != 0 {
+                let first = blockers & blockers.wrapping_neg();
+                if bishops & first != 0 { return true; }
+            }
+            let blockers = RAY[sq][5] & occ; // SW
+            if blockers != 0 {
+                let last = 1u64 << (63 - blockers.leading_zeros());
+                if bishops & last != 0 { return true; }
+            }
+            let blockers = RAY[sq][7] & occ; // NW
+            if blockers != 0 {
+                let last = 1u64 << (63 - blockers.leading_zeros());
+                if bishops & last != 0 { return true; }
+            }
         }
         false
     }
@@ -757,15 +879,36 @@ mod tests {
             .map(|i| splitmix((i as u64).wrapping_mul(0x9E3779B97F4A7C15)))
             .collect();
         for _ in 0..200 {
-            let moves = crate::movegen::generate_legal(&mut b);
+            let mut moves = crate::movegen::MoveList::new();
+            crate::movegen::generate_legal(&mut b, &mut moves);
             if moves.is_empty() {
                 break;
             }
-            let m = moves[(urandom[moves.len()] as usize) % moves.len()];
+            let m = moves.as_slice()[(urandom[moves.len] as usize) % moves.len];
             let _ = b.make(m);
             assert_eq!(b.key, b.compute_key(), "hash invariant broken after {}", m.uci());
             b.unmake(m);
             assert_eq!(b.key, b.compute_key(), "hash invariant broken after unmake {}", m.uci());
+        }
+    }
+
+    #[test]
+    fn pst_incremental_consistency() {
+        let mut b = Board::startpos();
+        let urandom: Vec<u64> = (0..200)
+            .map(|i| splitmix((i as u64).wrapping_mul(0x2545F4914F6CDD1D)))
+            .collect();
+        for _ in 0..200 {
+            let mut moves = crate::movegen::MoveList::new();
+            crate::movegen::generate_legal(&mut b, &mut moves);
+            if moves.is_empty() {
+                break;
+            }
+            let m = moves.as_slice()[(urandom[moves.len] as usize) % moves.len];
+            let _ = b.make(m);
+            assert_eq!(b.pst, b.compute_pst(), "pst drift after {}", m.uci());
+            b.unmake(m);
+            assert_eq!(b.pst, b.compute_pst(), "pst drift after unmake {}", m.uci());
         }
     }
 
@@ -810,6 +953,98 @@ mod tests {
         assert_eq!(b.piece_on(a7()), PAWN);
     }
 
+    #[test]
+    fn mailbox_matches_bitboards() {
+        fn bit_on(b: &Board, sq: usize) -> usize {
+            for c in 0..2 {
+                for pc in 0..6 {
+                    if b.pieces[c][pc] & bit(sq) != 0 {
+                        return pc;
+                    }
+                }
+            }
+            NO_PIECE
+        }
+        fn check(b: &Board, tag: &str) {
+            for sq in 0..64 {
+                let m = b.mailbox[sq];
+                let expected = bit_on(b, sq);
+                if m == EMPTY_SQ {
+                    assert_eq!(expected, NO_PIECE, "{}: empty mismatch sq {}", tag, sq);
+                    continue;
+                }
+                assert_eq!((m & 7) as usize, expected, "{}: piece mismatch sq {}", tag, sq);
+                let expected_c =
+                    if b.occ[WHITE] & bit(sq) != 0 { WHITE } else { BLACK };
+                assert_eq!((m >> 3) as usize, expected_c, "{}: color mismatch sq {}", tag, sq);
+            }
+        }
+
+        let mut b = Board::from_fen("r3k2r/1pqnbppp/p3pn2/3p4/1P1P4/P1N1PN2/2PQ1PPP/R3K2R w KQkq - 0 1").unwrap();
+        check(&b, "fen");
+        let urandom: Vec<u64> = (0..200)
+            .map(|i| splitmix((i as u64).wrapping_mul(0x11A5D8C9B63F2E71)))
+            .collect();
+        for i in 0..200 {
+            let mut moves = crate::movegen::MoveList::new();
+            crate::movegen::generate_legal(&mut b, &mut moves);
+            if moves.is_empty() {
+                break;
+            }
+            let m = moves.as_slice()[(urandom[moves.len] as usize) % moves.len];
+            let _ = b.make(m);
+            check(&b, &format!("after make {}", m.uci()));
+            b.unmake(m);
+            check(&b, &format!("after unmake {}", m.uci()));
+            if i == 50 || i == 100 || i == 150 {
+                let fen = b.to_fen();
+                let rebuilt = Board::from_fen(&fen).unwrap();
+                check(&rebuilt, "fen roundtrip");
+            }
+        }
+    }
+
+    #[test]
+    fn pin_exposure_legality() {
+        // Black rook e8 pins white knight e2 to white king e1 on the e-file.
+        // A knight cannot stay on its pin line, so every knight move is illegal.
+        let mut b = Board::from_fen("k3r3/8/8/8/8/8/4n3/4K3 w - - 0 1").unwrap();
+        let m = b.uci_move("e2c3").unwrap();
+        assert!(!b.make(m), "pinned knight must not leave the file");
+        b.unmake(m);
+        assert_eq!(b.piece_on(e2()), KNIGHT);
+        let m = b.uci_move("e1f1").unwrap();
+        assert!(b.make(m), "king to f1 is legal here");
+        b.unmake(m);
+
+        // Fully pinned rook: may slide along the file, never leave it.
+        let mut b = Board::from_fen("k3r3/8/8/8/8/8/4r3/4K3 w - - 0 1").unwrap();
+        let m23 = b.uci_move("e2e3").unwrap();
+        assert!(b.make(m23), "e2-e3 stays pinned on the file");
+        b.unmake(m23);
+        let m24 = b.uci_move("e2e4").unwrap();
+        assert!(b.make(m24), "e2-e4 stays pinned on the file");
+        b.unmake(m24);
+        let mc2 = b.uci_move("e2c2").unwrap();
+        assert!(!b.make(mc2), "e2-c2 leaves the pin line");
+        b.unmake(mc2);
+
+        // Bishop pin on the a1-h8 diagonal: d4xe5 (capturing the pinner) is
+        // legal; d4-b2 stays on the same LINE but on the opposite ray of the
+        // king, and therefore still exposes it.
+        let mut b = Board::from_fen("8/8/8/4b3/3B4/2K5/8/k7 w - - 0 1").unwrap();
+        let mxe5 = b.uci_move("d4e5").unwrap();
+        assert!(b.make(mxe5), "capturing the pinner is legal");
+        b.unmake(mxe5);
+        let mb2 = b.uci_move("d4b2").unwrap();
+        assert!(!b.make(mb2), "same line but opposite ray exposes the king");
+        b.unmake(mb2);
+        let mc5 = b.uci_move("d4c5").unwrap();
+        assert!(!b.make(mc5), "off-line bishop move is illegal");
+        b.unmake(mc5);
+    }
+
+    fn e2() -> usize { 12 }
     fn a8() -> usize { 56 }
     fn a7() -> usize { 48 }
     fn b5() -> usize { 33 }

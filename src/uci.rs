@@ -16,13 +16,14 @@
 
 use crate::board::*;
 use crate::perft;
-use crate::search::{SearchLimits, SearchResult, Searcher};
+use crate::search::{SearchLimits, SearchResult, Searcher, TT};
 use std::io::BufRead;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ENGINE_NAME: &str = "Corvus 0.1.0";
 pub const ENGINE_AUTHOR: &str = "Avi";
@@ -42,6 +43,16 @@ struct CommandState {
     board: Board,
     abort: Option<Arc<AtomicBool>>,
     receiver: Option<mpsc::Receiver<SearchResult>>,
+    threads: usize,
+    /// Whether time-controlled game moves may be played from the internal book.
+    own_book: bool,
+    /// Persistent transposition table shared by every `go` in the session;
+    /// cleared on `ucinewgame` and resized by the `Hash` option.
+    tt: Arc<TT>,
+}
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1)
 }
 
 pub fn run() {
@@ -49,6 +60,9 @@ pub fn run() {
         board: Board::startpos(),
         abort: None,
         receiver: None,
+        threads: default_threads(),
+        own_book: true,
+        tt: Arc::new(TT::new(24)),
     };
 
     let stdin = std::io::stdin();
@@ -70,7 +84,35 @@ pub fn run() {
             "uci" => {
                 outln(format!("id name {}", ENGINE_NAME));
                 outln(format!("id author {}", ENGINE_AUTHOR));
+                outln(format!(
+                    "option name Threads type spin default {} min 1 max 512",
+                    default_threads()
+                ));
+                outln("option name Hash type spin default 256 min 1 max 4096".to_string());
+                outln("option name OwnBook type check default true".to_string());
                 outln("uciok".to_string());
+            }
+            "setoption" => {
+                if let Some(vpos) = tokens.iter().position(|&t| t == "value") {
+                    let name = tokens[1..vpos].join(" ");
+                    let value = tokens.get(vpos + 1).map(|s| s.to_string()).unwrap_or_default();
+                    if name.eq_ignore_ascii_case("Threads") {
+                        if let Ok(v) = value.parse::<usize>() {
+                            state.threads = v.clamp(1, 512);
+                        }
+                    } else if name.eq_ignore_ascii_case("OwnBook") {
+                        state.own_book = !value.eq_ignore_ascii_case("false");
+                    } else if name.eq_ignore_ascii_case("Hash") {
+                        if let Ok(mb) = value.parse::<usize>() {
+                            let mb = mb.clamp(1, 4096);
+                            // TTEntry = 16 bytes, so MB * 65536 entries;
+                            // TT::new takes the power-of-two bucket count.
+                            let entries = mb * 65536;
+                            let pow = (usize::BITS - 1 - entries.leading_zeros()) as u32;
+                            state.tt = Arc::new(TT::new(pow));
+                        }
+                    }
+                }
             }
             "isready" => {
                 outln("readyok".to_string());
@@ -80,6 +122,7 @@ pub fn run() {
                     a.store(true, Ordering::Relaxed);
                 }
                 drain_result(&mut state);
+                state.tt.clear();
                 state.board = Board::startpos();
                 state.abort = None;
                 state.receiver = None;
@@ -100,18 +143,30 @@ pub fn run() {
                 drain_result(&mut state);
                 let abort = Arc::new(AtomicBool::new(false));
                 let limits = parse_go(&tokens[1..]);
-                let mut searcher = Searcher::new(state.board.clone());
-                searcher.abort = abort.clone();
+                let board = state.board.clone();
+                let threads = state.threads;
+                // Fresh decorrelator per move so openings vary across games
+                // (and even within replay/analysis loops).
+                let seed = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
                 let (tx, rx) = mpsc::channel();
-                state.abort = Some(abort);
+                let state_tt = state.tt.clone();
+                // The book only helps real game moves, never `go depth`/`nodes`/
+                // `infinite` analysis requests.
+                let use_book = state.own_book && (limits.wtime > 0 || limits.btime > 0);
+                state.abort = Some(abort.clone());
                 state.receiver = Some(rx);
                 thread::spawn(move || {
-                    let result = searcher.think(limits);
+                    let result = Searcher::think_parallel(board, limits, threads, false, abort.clone(), seed, use_book, state_tt);
                     let _ = tx.send(result);
-                    if !searcher.abort.load(Ordering::Relaxed) {
-                        let mv = result.best.map(|m| m.uci()).unwrap_or_else(|| "(none)".to_string());
-                        outln(format!("bestmove {}", mv));
-                    }
+                    // Always emit bestmove — including when the search was
+                    // aborted by `stop`.  Suppressing it on abort left GUIs
+                    // waiting forever after interrupting a search (UCI
+                    // requires a bestmove answer to both `go` and `stop`).
+                    let mv = result.best.map(|m| m.uci()).unwrap_or_else(|| "(none)".to_string());
+                    outln(format!("bestmove {}", mv));
                 });
             }
             "stop" => {

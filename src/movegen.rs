@@ -18,9 +18,173 @@ use crate::bitboard::*;
 use crate::board::*;
 use crate::eval::PIECE_VALUES;
 
+/// Maximum number of pseudo-legal moves in any position (218 documented max).
+pub const MAX_MOVES: usize = 256;
 
-pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
-    let mut moves = Vec::with_capacity(64);
+/// Stack-allocated move list — zero heap allocation on the hot path.
+/// Entries are `MaybeUninit`: `new()` is O(1) (no 256-element initialization),
+/// and only the pushed prefix is ever read.
+pub struct MoveList {
+    moves: [core::mem::MaybeUninit<Move>; MAX_MOVES],
+    pub len: usize,
+}
+
+impl MoveList {
+    #[inline(always)]
+    pub fn new() -> Self {
+        MoveList {
+            moves: [core::mem::MaybeUninit::uninit(); MAX_MOVES],
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, m: Move) {
+        self.moves[self.len] = core::mem::MaybeUninit::new(m);
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[Move] {
+        // SAFETY: only `0..len` entries are written (each via `push`, which
+        // initializes before incrementing `len`); indices below `len` are valid.
+        unsafe { core::slice::from_raw_parts(self.moves.as_ptr() as *const Move, self.len) }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    pub fn iter(&self) -> core::slice::Iter<'_, Move> {
+        self.as_slice().iter()
+    }
+
+    pub fn contains(&self, m: &Move) -> bool {
+        self.as_slice().iter().any(|x| x == m)
+    }
+
+    pub fn retain<F: FnMut(&Move) -> bool>(&mut self, mut f: F) {
+        // Swap-remove in place; `s` is derived from a raw pointer so touching
+        // `self.len` afterwards does not conflict with `s`'s exclusive borrow.
+        let s: &mut [Move] =
+            unsafe { core::slice::from_raw_parts_mut(self.moves.as_mut_ptr() as *mut Move, MAX_MOVES) };
+        let mut i = 0;
+        while i < self.len {
+            if f(&s[i]) {
+                i += 1;
+            } else {
+                s[i] = s[self.len - 1];
+                self.len -= 1;
+            }
+        }
+    }
+}
+
+/// A scored move for move ordering — also stack-allocated, O(1) init.
+#[derive(Clone, Copy)]
+pub struct ScoredMove {
+    pub mov: Move,
+    pub score: i32,
+}
+
+/// Stack-allocated scored move list for move ordering.
+pub struct ScoredMoveList {
+    entries: [core::mem::MaybeUninit<ScoredMove>; MAX_MOVES],
+    pub len: usize,
+}
+
+impl ScoredMoveList {
+    #[inline(always)]
+    pub fn new() -> Self {
+        ScoredMoveList {
+            entries: [core::mem::MaybeUninit::uninit(); MAX_MOVES],
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, mov: Move, score: i32) {
+        self.entries[self.len] = core::mem::MaybeUninit::new(ScoredMove { mov, score });
+        self.len += 1;
+    }
+
+    /// Iterator yielding `(Move, score)` pairs for the scored entries.
+    #[inline(always)]
+    pub fn iter(&self) -> impl Iterator<Item = (Move, i32)> + '_ {
+        // SAFETY: same reasoning as MoveList::as_slice.
+        let s: &[ScoredMove] =
+            unsafe { core::slice::from_raw_parts(self.entries.as_ptr() as *const ScoredMove, self.len) };
+        s.iter().map(|e| (e.mov, e.score))
+    }
+
+    /// Read entry `i` (must be `< len`). Lets the recursion read a move/score
+    /// without holding a borrow of the list across a recursive search call,
+    /// which would conflict with the arena being borrowed mutably.
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> (Move, i32) {
+        debug_assert!(i < self.len);
+        // SAFETY: `i < len` implies the entry was initialized by `push`.
+        let e = unsafe { &*(self.entries.as_ptr().add(i) as *const ScoredMove) };
+        (e.mov, e.score)
+    }
+
+    /// First (highest-scoring) move, or a null move if the list is empty.
+    #[inline(always)]
+    pub fn first_mov(&self) -> Move {
+        if self.len == 0 {
+            return Move::normal(0, 0, 0, NO_PIECE);
+        }
+        // SAFETY: entries[0] is written when len > 0.
+        unsafe { (*(self.entries.as_ptr() as *const ScoredMove)).mov }
+    }
+
+    /// Sort descending by score (unstable; fast for small N).
+    pub fn sort_desc(&mut self) {
+        // SAFETY: only the first `len` entries have been initialized.
+        let s: &mut [ScoredMove] = unsafe {
+            core::slice::from_raw_parts_mut(self.entries.as_mut_ptr() as *mut ScoredMove, self.len)
+        };
+        s.sort_unstable_by(|a, b| b.score.cmp(&a.score));
+    }
+}
+
+/// Fast direct-check detection without make/unmake.  Handles direct attacks
+/// from the piece arriving on `m.to`.  Rare discovered checks from EP are
+/// conservatively treated as non-checks — safe for pruning guards at low depth.
+#[inline(always)]
+pub fn gives_check_fast(b: &Board, m: Move) -> bool {
+    if m.flags == M_EP {
+        // Removing two pawns can open a discovered check.  Return false —
+        // the pruning margins protect against rare tactical misses.
+        return false;
+    }
+    let them = b.side ^ 1;
+    let king_sq = b.kingsq[them];
+    let occ_no_from = b.all & !bit(m.from);
+    let to_bit = bit(m.to);
+
+    let piece = if m.promo != NO_PIECE { m.promo } else { m.piece };
+    match piece {
+        KNIGHT => KNIGHT_ATTACKS[m.to] & to_bit & bit(king_sq) != 0,
+        BISHOP => bishop_attacks(occ_no_from, m.to) & bit(king_sq) != 0,
+        ROOK => rook_attacks(occ_no_from, m.to) & bit(king_sq) != 0,
+        QUEEN => queen_attacks(occ_no_from, m.to) & bit(king_sq) != 0,
+        KING => false,
+        _ => PAWN_ATTACKS[b.side][m.to] & bit(king_sq) != 0,
+    }
+}
+
+/// Generate all pseudo-legal moves, **replacing** any previous contents of
+/// `list` (callers may reuse a list; nothing is appended to).
+pub fn generate_pseudo(b: &Board, list: &mut MoveList) {
+    list.len = 0;
     let us = b.side;
     let them = us ^ 1;
     let own = b.occ[us];
@@ -35,7 +199,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
         while t != 0 {
             let to = t.trailing_zeros() as usize;
             t &= t - 1;
-            moves.push(Move::normal(sq, to, KNIGHT, b.piece_on(to)));
+            list.push(Move::normal(sq, to, KNIGHT, b.piece_on(to)));
         }
     }
 
@@ -47,7 +211,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
         while t != 0 {
             let to = t.trailing_zeros() as usize;
             t &= t - 1;
-            moves.push(Move::normal(sq, to, BISHOP, b.piece_on(to)));
+            list.push(Move::normal(sq, to, BISHOP, b.piece_on(to)));
         }
     }
 
@@ -59,7 +223,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
         while t != 0 {
             let to = t.trailing_zeros() as usize;
             t &= t - 1;
-            moves.push(Move::normal(sq, to, ROOK, b.piece_on(to)));
+            list.push(Move::normal(sq, to, ROOK, b.piece_on(to)));
         }
     }
 
@@ -71,7 +235,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
         while t != 0 {
             let to = t.trailing_zeros() as usize;
             t &= t - 1;
-            moves.push(Move::normal(sq, to, QUEEN, b.piece_on(to)));
+            list.push(Move::normal(sq, to, QUEEN, b.piece_on(to)));
         }
     }
 
@@ -83,7 +247,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
         while t != 0 {
             let to = t.trailing_zeros() as usize;
             t &= t - 1;
-            moves.push(Move::normal(sq, to, KING, b.piece_on(to)));
+            list.push(Move::normal(sq, to, KING, b.piece_on(to)));
         }
     }
 
@@ -98,12 +262,12 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
             if one < 64 && all & bit(one) == 0 {
                 if r == 6 {
                     for p in [KNIGHT, BISHOP, ROOK, QUEEN] {
-                        moves.push(Move::promo(sq, one, p));
+                        list.push(Move::promo(sq, one, p));
                     }
                 } else {
-                    moves.push(Move::normal(sq, one, PAWN, NO_PIECE));
+                    list.push(Move::normal(sq, one, PAWN, NO_PIECE));
                     if r == 1 && all & bit(sq + 16) == 0 {
-                        moves.push(Move::normal(sq, sq + 16, PAWN, NO_PIECE));
+                        list.push(Move::normal(sq, sq + 16, PAWN, NO_PIECE));
                     }
                 }
             }
@@ -112,12 +276,12 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
             if all & bit(one) == 0 {
                 if r == 1 {
                     for p in [KNIGHT, BISHOP, ROOK, QUEEN] {
-                        moves.push(Move::promo(sq, one, p));
+                        list.push(Move::promo(sq, one, p));
                     }
                 } else {
-                    moves.push(Move::normal(sq, one, PAWN, NO_PIECE));
+                    list.push(Move::normal(sq, one, PAWN, NO_PIECE));
                     if r == 6 && all & bit(sq - 16) == 0 {
-                        moves.push(Move::normal(sq, sq - 16, PAWN, NO_PIECE));
+                        list.push(Move::normal(sq, sq - 16, PAWN, NO_PIECE));
                     }
                 }
             }
@@ -129,7 +293,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
             atk &= atk - 1;
             if us == WHITE && rank_of(to) == 7 {
                 for p in [KNIGHT, BISHOP, ROOK, QUEEN] {
-                    moves.push(Move {
+                    list.push(Move {
                         from: sq,
                         to,
                         piece: PAWN,
@@ -140,7 +304,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
                 }
             } else if us == BLACK && rank_of(to) == 0 {
                 for p in [KNIGHT, BISHOP, ROOK, QUEEN] {
-                    moves.push(Move {
+                    list.push(Move {
                         from: sq,
                         to,
                         piece: PAWN,
@@ -150,7 +314,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
                     });
                 }
             } else {
-                moves.push(Move::normal(sq, to, PAWN, b.piece_on(to)));
+                list.push(Move::normal(sq, to, PAWN, b.piece_on(to)));
             }
         }
     }
@@ -161,7 +325,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
         while a != 0 {
             let sq = a.trailing_zeros() as usize;
             a &= a - 1;
-            moves.push(Move::ep(sq, e));
+            list.push(Move::ep(sq, e));
         }
     }
 
@@ -173,7 +337,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
                 && b.pieces[us][ROOK] & bit(7) != 0
                 && !b.attacked(them, 5)
             {
-                moves.push(Move::castle(4, 6));
+                list.push(Move::castle(4, 6));
             }
             if b.castle & WQ != 0
                 && all & bit(1) == 0
@@ -182,7 +346,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
                 && b.pieces[us][ROOK] & bit(0) != 0
                 && !b.attacked(them, 3)
             {
-                moves.push(Move::castle(4, 2));
+                list.push(Move::castle(4, 2));
             }
         } else {
             if b.castle & BK != 0
@@ -191,7 +355,7 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
                 && b.pieces[us][ROOK] & bit(63) != 0
                 && !b.attacked(them, 61)
             {
-                moves.push(Move::castle(60, 62));
+                list.push(Move::castle(60, 62));
             }
             if b.castle & BQ != 0
                 && all & bit(57) == 0
@@ -200,41 +364,72 @@ pub fn generate_pseudo(b: &mut Board) -> Vec<Move> {
                 && b.pieces[us][ROOK] & bit(56) != 0
                 && !b.attacked(them, 59)
             {
-                moves.push(Move::castle(60, 58));
+                list.push(Move::castle(60, 58));
             }
         }
     }
-
-    moves
 }
 
-pub fn generate_legal(b: &mut Board) -> Vec<Move> {
-    let moves = generate_pseudo(b);
-    moves
-        .into_iter()
-        .filter(|&m| {
-            let legal = b.make(m);
+/// Generate only legal moves.  Uses swap-remove on the stack list — zero allocation.
+pub fn generate_legal(b: &mut Board, list: &mut MoveList) {
+    generate_pseudo(b, list);
+    // Raw slice over the MaybeUninit backing so we can swap-remove in place.
+    let s: &mut [Move] =
+        unsafe { core::slice::from_raw_parts_mut(list.moves.as_mut_ptr() as *mut Move, MAX_MOVES) };
+    let mut i = 0;
+    while i < list.len {
+        let m = s[i];
+        if !b.make(m) {
+            // `make` pushes an undo record even for illegal moves; restore it
+            // so the board is reusable for the remaining candidates.
             b.unmake(m);
-            legal
-        })
-        .collect()
+            // swap-remove illegal move
+            list.len -= 1;
+            s[i] = s[list.len];
+        } else {
+            b.unmake(m);
+            i += 1;
+        }
+    }
 }
 
-pub fn generate_captures(b: &mut Board) -> Vec<Move> {
-    generate_pseudo(b)
-        .into_iter()
-        .filter(|m| m.captured != NO_PIECE || m.promo != NO_PIECE)
-        .collect()
+/// Generate only captures and promotions.  Generates all pseudo, then retains.
+pub fn generate_captures(b: &Board, list: &mut MoveList) {
+    generate_pseudo(b, list);
+    list.retain(|m| m.captured != NO_PIECE || m.promo != NO_PIECE);
 }
 
 fn attackers_mask(b: &Board, occ: u64, sq: usize, color: usize) -> u64 {
     let mut m = PAWN_ATTACKS[color ^ 1][sq] & b.pieces[color][PAWN];
     m |= KNIGHT_ATTACKS[sq] & b.pieces[color][KNIGHT];
     m |= KING_ATTACKS[sq] & b.pieces[color][KING];
-    let d = bishop_attacks(occ, sq);
-    let o = rook_attacks(occ, sq);
-    m |= d & (b.pieces[color][BISHOP] | b.pieces[color][QUEEN]);
-    m |= o & (b.pieces[color][ROOK] | b.pieces[color][QUEEN]);
+    // First blockers along each ray are the only possible slider attackers.
+    let rooks = b.pieces[color][ROOK] | b.pieces[color][QUEEN];
+    let bishops = b.pieces[color][BISHOP] | b.pieces[color][QUEEN];
+    for d in [0usize, 2, 4, 6] {
+        let blockers = RAY[sq][d] & occ;
+        if blockers == 0 {
+            continue;
+        }
+        let first = if DIRD[d] > 0 {
+            blockers & blockers.wrapping_neg()
+        } else {
+            1u64 << (63 - blockers.leading_zeros())
+        };
+        m |= rooks & first;
+    }
+    for d in [1usize, 3, 5, 7] {
+        let blockers = RAY[sq][d] & occ;
+        if blockers == 0 {
+            continue;
+        }
+        let first = if DIRD[d] > 0 {
+            blockers & blockers.wrapping_neg()
+        } else {
+            1u64 << (63 - blockers.leading_zeros())
+        };
+        m |= bishops & first;
+    }
     m
 }
 
@@ -277,7 +472,9 @@ mod tests {
     #[test]
     fn startpos_move_count() {
         let mut b = Board::startpos();
-        assert_eq!(generate_legal(&mut b).len(), 20);
+        let mut list = MoveList::new();
+        generate_legal(&mut b, &mut list);
+        assert_eq!(list.len(), 20);
         assert_eq!(crate::perft::perft(&mut b, 1), 20);
         assert_eq!(crate::perft::perft(&mut b, 2), 400);
     }
@@ -288,9 +485,10 @@ mod tests {
             "rnb1kbnr/pppp1ppp/4p3/8/3P1q2/6P1/PPP2P1P/RNBQKBNR w KQkq - 0 1",
         )
         .unwrap();
-        let moves = generate_legal(&mut b);
+        let mut list = MoveList::new();
+        generate_legal(&mut b, &mut list);
         assert!(
-            moves.iter().any(|m| m.from == 22 && m.to == 29 && m.piece == PAWN),
+            list.iter().any(|m| m.from == 22 && m.to == 29 && m.piece == PAWN),
             "g3xf4 missing from legal moves"
         );
     }

@@ -1,4 +1,5 @@
 use chess_engine::board::Board;
+use chess_engine::movegen::{generate_legal, MoveList};
 use chess_engine::search::{SearchLimits, Searcher};
 
 fn main() {
@@ -13,8 +14,9 @@ fn main() {
     println!("Side to move: {}", b.side);
     
     // Test root moves generation
-    let root_moves = chess_engine::movegen::generate_legal(&mut s.board);
-    println!("Root moves generated: {}", root_moves.len());
+    let mut root_moves = MoveList::new();
+    generate_legal(&mut s.board, &mut root_moves);
+    println!("Root moves generated: {}", root_moves.len);
     for (i, m) in root_moves.iter().take(5).enumerate() {
         println!("  {}: {}", i + 1, m.uci());
     }

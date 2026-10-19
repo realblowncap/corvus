@@ -1,0 +1,5 @@
+# Corvus Chess Engine — local build configuration
+# This crate has no build scripts or proc-macros, so applying the CPU flags
+# globally is safe.  Compile for the build machine's exact CPU (SIMD, BMI2).
+[build]
+rustflags = ["-C", "target-cpu=native"]

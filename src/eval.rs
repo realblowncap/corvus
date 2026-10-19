@@ -21,6 +21,74 @@ pub const MATE: i32 = 32000;
 
 pub const PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 0];
 
+/// Experimental: 1 = original attacked-piece penalty, 0 = disabled.
+pub const ATTACKED_PEN_MUL: i32 = 0;
+
+/// Midgame piece-square tables (from white's perspective, unpromoted).
+pub const PST: [[i32; 64]; 6] = [
+    PST_PAWN, PST_KNIGHT, PST_BISHOP, PST_ROOK, PST_QUEEN, PST_KING,
+];
+
+/// Endgame piece-square tables.
+pub const PST_EG: [[i32; 64]; 6] = [
+    PST_PAWN_EG, PST_KNIGHT, PST_BISHOP, PST_ROOK, PST_QUEEN, PST_KING_EG,
+];
+
+/// Midgame phase weight for a given number of non-pawn, non-king material on
+/// the board.  Full middlegame = 24, pure king-only endgame = 0.
+pub fn phase(boards: &[[u64; 6]; 2]) -> i32 {
+    let mut mat = 0i32;
+    for c in 0..2 {
+        mat += 4 * boards[c][QUEEN].count_ones() as i32;
+        mat += 2 * boards[c][ROOK].count_ones() as i32;
+        mat += (boards[c][KNIGHT].count_ones() + boards[c][BISHOP].count_ones()) as i32;
+    }
+    (24 - mat).clamp(0, 24)
+}
+
+/// Blended PST tables by phase (0..=24), piece (0..6), and square index in
+/// classic layout (0=a8). Access with `pst_index(c,sq)`.
+#[inline(always)]
+const fn blend_pst(p: i32, pc: usize, m: usize) -> i32 {
+    let w = 24 - p;
+    (PST[pc][m] * w + PST_EG[pc][m] * p) / 24
+}
+
+const fn build_blended() -> [[[i32; 64]; 6]; 25] {
+    let mut t = [[[0i32; 64]; 6]; 25];
+    let mut ph = 0i32;
+    while ph <= 24 {
+        let mut pc = 0usize;
+        while pc < 6 {
+            let mut sq = 0usize;
+            while sq < 64 {
+                t[ph as usize][pc][sq] = blend_pst(ph, pc, sq);
+                sq += 1;
+            }
+            pc += 1;
+        }
+        ph += 1;
+    }
+    t
+}
+
+const BLENDED_PST: [[[i32; 64]; 6]; 25] = build_blended();
+
+/// Map a square from color `c`'s point of view to the table index.  Tables are
+/// stored in classic form (index 0 = rank 8, i.e. a8..h8 first), so white
+/// flips vertically and black reads the table directly.  One set of PST tables
+/// then serves both sides.
+#[inline(always)]
+pub fn pst_index(c: usize, sq: usize) -> usize {
+    if c == BLACK { sq } else { sq ^ 56 }
+}
+
+/// Per-piece score (material + midgame PST) for one piece of color `c` on
+/// square `sq`, from white's perspective.
+pub fn pp_value(c: usize, pc: usize, sq: usize) -> i32 {
+    PIECE_VALUES[pc] + PST[pc][pst_index(c, sq)]
+}
+
 const PST_PAWN: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0,
     50, 50, 50, 50, 50, 50, 50, 50,
@@ -77,14 +145,14 @@ const PST_QUEEN: [i32; 64] = [
 ];
 
 const PST_KING: [i32; 64] = [
-    20, 30, 10, 0, 0, 10, 30, 20,
-    20, 20, 0, 0, 0, 0, 20, 20,
-    -10, -20, -20, -20, -20, -20, -20, -10,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
     -20, -30, -30, -40, -40, -30, -30, -20,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
-    -30, -40, -40, -50, -50, -40, -40, -30,
+    -10, -20, -20, -20, -20, -20, -20, -10,
+    20, 20, 0, 0, 0, 0, 20, 20,
+    20, 30, 10, 0, 0, 10, 30, 20,
 ];
 
 const PST_KING_EG: [i32; 64] = [
@@ -98,10 +166,6 @@ const PST_KING_EG: [i32; 64] = [
     -30, -20, -10, -10, -10, -10, -20, -30,
 ];
 
-const PST: [[i32; 64]; 6] = [
-    PST_PAWN, PST_KNIGHT, PST_BISHOP, PST_ROOK, PST_QUEEN, PST_KING,
-];
-
 const PST_PAWN_EG: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -111,10 +175,6 @@ const PST_PAWN_EG: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-];
-
-const PST_EG: [[i32; 64]; 6] = [
-    PST_PAWN_EG, PST_KNIGHT, PST_BISHOP, PST_ROOK, PST_QUEEN, PST_KING_EG,
 ];
 
 const EG_PASSED: i32 = 28;
@@ -167,33 +227,37 @@ fn pinned_mask(b: &Board, side: usize) -> u64 {
     let dia = b.pieces[enemy][BISHOP] | b.pieces[enemy][QUEEN];
     let orth = b.pieces[enemy][ROOK] | b.pieces[enemy][QUEEN];
 
-    let dirs: [(i32, i32); 8] = [
-        (0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1),
-    ];
     let mut pinned = 0u64;
-    for (dr, df) in dirs {
-        let diag = dr != 0 && df != 0;
+    for d in 0..8usize {
+        let ray = RAY[ks][d];
+        let blockers = ray & occ;
+        if blockers == 0 {
+            continue;
+        }
+        // Nearest occupant along the ray: it must be our own piece.
+        let first = if DIRD[d] > 0 {
+            blockers.trailing_zeros()
+        } else {
+            63 - blockers.leading_zeros()
+        } as usize;
+        if own & bit(first) == 0 {
+            continue;
+        }
+        // Pin only applies when the next occupant beyond it is an enemy slider
+        // of matching orientation (any own piece between them shields the pin).
+        let beyond = RAY[first][d] & occ;
+        if beyond == 0 {
+            continue;
+        }
+        let nearest = if DIRD[d] > 0 {
+            beyond.trailing_zeros()
+        } else {
+            63 - beyond.leading_zeros()
+        } as usize;
+        let diag = d & 1 == 1;
         let sliders = if diag { dia } else { orth };
-        let mut kr = rank_of(ks) as i32 + dr;
-        let mut kf = file_of(ks) as i32 + df;
-        let mut blocker: Option<usize> = None;
-        while (0..8).contains(&kr) && (0..8).contains(&kf) {
-            let sq = kr as usize * 8 + kf as usize;
-            if own & bit(sq) != 0 {
-                if blocker.is_some() {
-                    break;
-                }
-                blocker = Some(sq);
-            } else if occ & bit(sq) != 0 {
-                if sliders & bit(sq) != 0 {
-                    if let Some(bs) = blocker {
-                        pinned |= bit(bs);
-                    }
-                }
-                break;
-            }
-            kr += dr;
-            kf += df;
+        if sliders & bit(nearest) != 0 {
+            pinned |= bit(first);
         }
     }
     pinned
@@ -202,13 +266,7 @@ fn pinned_mask(b: &Board, side: usize) -> u64 {
 pub fn evaluate(b: &Board) -> i32 {
     let mut score = 0i32;
 
-    let mut mat_phase = 0i32;
-    for c in 0..2 {
-        mat_phase += 4 * b.pieces[c][QUEEN].count_ones() as i32;
-        mat_phase += 2 * b.pieces[c][ROOK].count_ones() as i32;
-        mat_phase += (b.pieces[c][KNIGHT].count_ones() + b.pieces[c][BISHOP].count_ones()) as i32;
-    }
-    let p = (24 - mat_phase).clamp(0, 24);
+    let p = phase(&b.pieces);
     let mut attacked_by = [0u64; 2];
     let mut king_cover = [0u64; 2];
     let mut atk_force = [0i32; 2];
@@ -231,8 +289,8 @@ pub fn evaluate(b: &Board) -> i32 {
             while bb != 0 {
                 let sq = bb.trailing_zeros() as usize;
                 bb &= bb - 1;
-                let mapped = if c == BLACK { sq } else { sq ^ 56 };
-                let ps = (PST[pc][mapped] * (24 - p) + PST_EG[pc][mapped] * p) / 24;
+                let mapped = pst_index(c, sq);
+                let ps = BLENDED_PST[p as usize][pc][mapped];
                 side += PIECE_VALUES[pc] + ps;
                 if pc == KNIGHT || pc == BISHOP || pc == ROOK || pc == QUEEN {
                     let attacks = match pc {
@@ -427,17 +485,16 @@ pub fn evaluate(b: &Board) -> i32 {
                 }
             }
         }
-        let queens = b.pieces[0][QUEEN] | b.pieces[1][QUEEN];
-        let rooks_all = b.pieces[0][ROOK] | b.pieces[1][ROOK];
-        let midgame = queens.count_ones() > 0 || rooks_all.count_ones() >= 3;
+        let midgame = b.pieces[c ^ 1][QUEEN].count_ones() > 0
+            || (b.pieces[c ^ 1][ROOK].count_ones() + b.pieces[c ^ 1][QUEEN].count_ones()) >= 3;
         let home_rank = if c == WHITE { 0 } else { 7 };
         if midgame && kr as i32 != home_rank {
             side -= KING_EXPOSED;
             // Additional penalty for king exposure in open positions
+            let all_pawns = b.pieces[0][PAWN] | b.pieces[1][PAWN];
             let open_files = (0..8).filter(|&f| {
                 let file_mask = FILE_MASK[f];
-                let pawns_in_file = (b.pieces[0][PAWN] | b.pieces[1][PAWN]) & file_mask;
-                pawns_in_file == 0
+                (all_pawns & file_mask) == 0
             }).count() as i32;
             if open_files >= 3 {
                 side -= KING_EXPOSED / 2;
@@ -454,87 +511,48 @@ pub fn evaluate(b: &Board) -> i32 {
 
         let enemy_king_file = file_of(b.kingsq[c ^ 1]) as i32;
         {
-            let mut pcs = b.pieces[c][ROOK] | b.pieces[c][QUEEN];
-            let mut file_pieces = [0u64; 8];
-            let mut file_cnt = [0u32; 8];
-            while pcs != 0 {
-                let sq = pcs.trailing_zeros() as usize;
-                pcs &= pcs - 1;
-                let f = file_of(sq);
-                file_cnt[f] += 1;
-                file_pieces[f] |= bit(sq);
-            }
-            for f in 0..8 {
-                if file_cnt[f] != 2 {
-                    continue;
+            let heavy = b.pieces[c][ROOK] | b.pieces[c][QUEEN];
+            if heavy.count_ones() >= 2 {
+                let mut pcs = heavy;
+                let mut file_pieces = [0u64; 8];
+                let mut file_cnt = [0u32; 8];
+                while pcs != 0 {
+                    let sq = pcs.trailing_zeros() as usize;
+                    pcs &= pcs - 1;
+                    let f = file_of(sq);
+                    file_cnt[f] += 1;
+                    file_pieces[f] |= bit(sq);
                 }
-                let m = file_pieces[f];
-                let sq1 = m.trailing_zeros() as usize;
-                let sq2 = (m ^ bit(sq1)).trailing_zeros() as usize;
-                let (r1, r2) = (
-                    rank_of(sq1).min(rank_of(sq2)),
-                    rank_of(sq1).max(rank_of(sq2)),
-                );
-                let mut clear = true;
-                for r in (r1 + 1)..r2 {
-                    if b.all & bit(r * 8 + f) != 0 {
-                        clear = false;
-                        break;
-                    }
-                }
-                if clear {
-                    let mut bonus = if m & b.pieces[c][QUEEN] != 0 {
-                        QUEEN_ROOK_BATTERY
-                    } else {
-                        ROOK_BATTERY
-                    };
-                    if b.pieces[c ^ 1][PAWN] & FILE_MASK[f] == 0 {
-                        bonus += BATTERY_HALF_OPEN;
-                    }
-                    if (enemy_king_file - f as i32).abs() <= 1 {
-                        bonus += BATTERY_AT_KING;
-                    }
-                    side += bonus;
-                }
-            }
-        }
-        {
-            let mut pcs = b.pieces[c][BISHOP] | b.pieces[c][QUEEN];
-            let mut diag1 = [0u64; 15];
-            let mut diag2 = [0u64; 15];
-            while pcs != 0 {
-                let sq = pcs.trailing_zeros() as usize;
-                pcs &= pcs - 1;
-                let f = file_of(sq);
-                let r = rank_of(sq);
-                diag1[f + r] |= bit(sq);
-                diag2[f + 7 - r] |= bit(sq);
-            }
-            for di in 0..15 {
-                for acc in [&diag1[..], &diag2[..]] {
-                    let m = acc[di];
-                    if m.count_ones() != 2 || m & b.pieces[c][BISHOP] == 0 || m & b.pieces[c][QUEEN] == 0 {
+                for f in 0..8 {
+                    if file_cnt[f] != 2 {
                         continue;
                     }
+                    let m = file_pieces[f];
                     let sq1 = m.trailing_zeros() as usize;
                     let sq2 = (m ^ bit(sq1)).trailing_zeros() as usize;
-                    let (lo, hi) = if sq1 < sq2 { (sq1, sq2) } else { (sq2, sq1) };
-                    let step = if (hi - lo) % 9 == 0 { 9 } else { 7 };
+                    let (r1, r2) = (
+                        rank_of(sq1).min(rank_of(sq2)),
+                        rank_of(sq1).max(rank_of(sq2)),
+                    );
                     let mut clear = true;
-                    let mut cur = lo + step;
-                    while cur < hi {
-                        if b.all & bit(cur) != 0 {
+                    let mut r = r1 + 1;
+                    while r < r2 {
+                        if b.all & bit(r * 8 + f) != 0 {
                             clear = false;
                             break;
                         }
-                        cur += step;
+                        r += 1;
                     }
                     if clear {
-                        let ek = b.kingsq[c ^ 1];
-                        let same_diag =
-                            (file_of(ek) + rank_of(ek) == di) || (file_of(ek) + 7 - rank_of(ek) == di);
-                        let mut bonus = BISHOP_QUEEN_BATTERY;
-                        if same_diag {
+                        let mut bonus = if m & b.pieces[c][QUEEN] != 0 {
+                            QUEEN_ROOK_BATTERY
+                        } else {
+                            ROOK_BATTERY
+                        };
+                        if b.pieces[c ^ 1][PAWN] & FILE_MASK[f] == 0 {
+                            bonus += BATTERY_HALF_OPEN;
+                        }
+                        if (enemy_king_file - f as i32).abs() <= 1 {
                             bonus += BATTERY_AT_KING;
                         }
                         side += bonus;
@@ -542,33 +560,86 @@ pub fn evaluate(b: &Board) -> i32 {
                 }
             }
         }
+        {
+            let has_b = b.pieces[c][BISHOP].count_ones() > 0;
+            let has_q = b.pieces[c][QUEEN].count_ones() > 0;
+            if has_b && has_q {
+                let mut pcs = b.pieces[c][BISHOP] | b.pieces[c][QUEEN];
+                let mut diag1 = [0u64; 15];
+                let mut diag2 = [0u64; 15];
+                while pcs != 0 {
+                    let sq = pcs.trailing_zeros() as usize;
+                    pcs &= pcs - 1;
+                    let f = file_of(sq);
+                    let r = rank_of(sq);
+                    diag1[f + r] |= bit(sq);
+                    diag2[f + 7 - r] |= bit(sq);
+                }
+                let mut di = 0usize;
+                while di < 15 {
+                    let mut a = 0usize;
+                    while a < 2 {
+                        let acc_arr = if a == 0 { &diag1 } else { &diag2 };
+                        let m = acc_arr[di];
+                        if m.count_ones() == 2 && (m & b.pieces[c][BISHOP]) != 0 && (m & b.pieces[c][QUEEN]) != 0 {
+                            let sq1 = m.trailing_zeros() as usize;
+                            let sq2 = (m ^ bit(sq1)).trailing_zeros() as usize;
+                            let (lo, hi) = if sq1 < sq2 { (sq1, sq2) } else { (sq2, sq1) };
+                            let step = if (hi - lo) % 9 == 0 { 9 } else { 7 };
+                            let mut clear = true;
+                            let mut cur = lo + step;
+                            while cur < hi {
+                                if b.all & bit(cur) != 0 {
+                                    clear = false;
+                                    break;
+                                }
+                                cur += step;
+                            }
+                            if clear {
+                                let ek = b.kingsq[c ^ 1];
+                                let same_diag = (file_of(ek) + rank_of(ek) == di) || (file_of(ek) + 7 - rank_of(ek) == di);
+                                let mut bonus = BISHOP_QUEEN_BATTERY;
+                                if same_diag {
+                                    bonus += BATTERY_AT_KING;
+                                }
+                                side += bonus;
+                            }
+                        }
+                        a += 1;
+                    }
+                    di += 1;
+                }
+            }
+        }
 
-        let mapped = if c == BLACK { ks } else { ks ^ 56 };
-        let king_pst = (PST_KING[mapped] * (24 - p) + PST_KING_EG[mapped] * p) / 24;
+        let mapped = pst_index(c, ks);
+        let king_pst = BLENDED_PST[p as usize][KING][mapped];
         let contrib = if c == WHITE { side + king_pst } else { -(side + king_pst) };
         score += contrib;
     }
 
-    for c in 0..2 {
-        let their = attacked_by[c ^ 1];
-        let mut pen = 0i32;
-        for pc in PAWN..=QUEEN {
-            let mut bb = b.pieces[c][pc];
-            while bb != 0 {
-                let sq = bb.trailing_zeros() as usize;
-                bb &= bb - 1;
-                if their & bit(sq) == 0 {
-                    continue;
+    if ATTACKED_PEN_MUL != 0 {
+        for c in 0..2 {
+            let their = attacked_by[c ^ 1];
+            let mut pen = 0i32;
+            for pc in PAWN..=QUEEN {
+                let mut bb = b.pieces[c][pc];
+                while bb != 0 {
+                    let sq = bb.trailing_zeros() as usize;
+                    bb &= bb - 1;
+                    if their & bit(sq) == 0 {
+                        continue;
+                    }
+                    let defended = attacked_by[c] & bit(sq) != 0;
+                    pen += ATTACKED_PEN_MUL * if defended {
+                        PIECE_VALUES[pc] / 10
+                    } else {
+                        PIECE_VALUES[pc] / 2 + PIECE_VALUES[pc] / 4
+                    };
                 }
-                let defended = attacked_by[c] & bit(sq) != 0;
-                pen += if defended {
-                    PIECE_VALUES[pc] / 10  // Reduced penalty for defended pieces
-                } else {
-                    PIECE_VALUES[pc] / 2 + PIECE_VALUES[pc] / 4  // Increased penalty for undefended
-                };
             }
+            score += if c == WHITE { -pen } else { pen };
         }
-        score += if c == WHITE { -pen } else { pen };
     }
 
     for c in 0..2 {
@@ -704,5 +775,39 @@ pub fn evaluate(b: &Board) -> i32 {
         score + 12
     } else {
         -score + 12
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pst_orientation_is_white_perspective() {
+        // Tables are stored classic form: index 0 = a8 (rank 8 first), so a
+        // white square flips vertically to its mirror rank, black reads as-is.
+        assert_eq!(pst_index(WHITE, 0), 56);
+        assert_eq!(pst_index(WHITE, 63), 7);
+        assert_eq!(pst_index(BLACK, 0), 0);
+        assert_eq!(pst_index(BLACK, 63), 63);
+        assert_eq!(pst_index(WHITE, 48), 8);
+        assert_eq!(pst_index(BLACK, 8), 8);
+
+        // A white pawn on the 7th rank and a black pawn on the 2nd rank are
+        // the same point of view: both one step from promotion, so both must
+        // read the same (high) PST row.
+        let w7 = pp_value(WHITE, PAWN, 48) - PIECE_VALUES[PAWN];
+        let b2 = pp_value(BLACK, PAWN, 8) - PIECE_VALUES[PAWN];
+        assert_eq!(w7, b2);
+        assert!(w7 > 0);
+
+        // The advanced pawn must outvalue its own unmoved partner.
+        let w2 = pp_value(WHITE, PAWN, 8) - PIECE_VALUES[PAWN];
+        assert!(w7 > w2);
+
+        // The midgame king table must reward castling over central wandering
+        // for both colors.
+        assert_eq!(pp_value(WHITE, KING, 6), pp_value(BLACK, KING, 62));
+        assert!(pp_value(WHITE, KING, 6) > pp_value(WHITE, KING, 36));
     }
 }

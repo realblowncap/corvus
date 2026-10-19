@@ -42,17 +42,20 @@ def elo(s):
     return float("inf") if s >= 1 else float("-inf")
 
 
-def play_game(path, limit, opening):
+def play_game(path, limit, tc, opening):
     """Return ('1-0'|'0-1'|'1/2-1/2', crasher) where crasher is 'w'/'b'/None."""
     eng = chess.engine.SimpleEngine.popen_uci(path)
     board = chess.Board(opening)
     turn = 'w'
     crasher = None
     try:
-        for _ in range(300):
+        for _ in range(600):
             if board.is_game_over():
                 break
-            result = eng.play(board, chess.engine.Limit(nodes=limit))
+            if tc and tc > 0:
+                result = eng.play(board, chess.engine.Limit(time=tc))
+            else:
+                result = eng.play(board, chess.engine.Limit(nodes=limit))
             if result.move is None:
                 break
             board.push(result.move)
@@ -71,7 +74,25 @@ def play_game(path, limit, opening):
 def main():
     old, new = sys.argv[1], sys.argv[2]
     rounds = int(sys.argv[3]) if len(sys.argv) > 3 else 40
-    nodes = int(sys.argv[4]) if len(sys.argv) > 4 else 300000
+    nodes = 300000
+    tc = 0.0
+    if len(sys.argv) > 4:
+        try:
+            # try int first (nodes), else float (time)
+            s = sys.argv[4]
+            if '.' in s:
+                tc = float(s)
+            else:
+                # could be "5" for 5 seconds or 300000 nodes; treat small ints as seconds for bullet
+                val = int(s)
+                if val < 60:  # seconds
+                    tc = float(val)
+                else:
+                    nodes = val
+                    tc = 0.0
+        except Exception:
+            pass
+    logpath = sys.argv[5] if len(sys.argv) > 5 else None
     logpath = sys.argv[5] if len(sys.argv) > 5 else None
     res = {"Old": 0, "New": 0, "Draw": 0}
     t0 = time.time()
@@ -79,7 +100,7 @@ def main():
     for i in range(rounds):
         op = OPENINGS[i % len(OPENINGS)]
         white, black = (old, new) if i % 2 == 0 else (new, old)
-        rw, cw = play_game(white, nodes, op)
+        rw, cw = play_game(white, nodes, tc, op)
         if rw == "1-0":
             res["Old" if white == old else "New"] += 1
         elif rw == "0-1":
@@ -103,7 +124,7 @@ def main():
     print(f"  Elo diff (Old - New) = {elo(S):+.0f}  CI [{elo(lo):+.0f}, {elo(hi):+.0f}]")
     if logpath:
         with open(logpath, "a") as f:
-            f.write(f"{datetime.datetime.now().isoformat()},{old},{new},nodes={nodes},"
+            f.write(f"{datetime.datetime.now().isoformat()},{old},{new},nodes={nodes},tc={tc},"
                     f"{rounds},{tot},{o},{n},{d},{S:.3f},{elo(S):+.0f}\n")
 
 
