@@ -166,9 +166,3 @@ src/
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 
 ---
-
-<div align="center">
-
-Made with 🦀 and an unreasonable amount of `bit(idx - 1)`.
-
-</div>
