@@ -16,6 +16,159 @@
 
 use crate::bitboard::*;
 use crate::board::*;
+use crate::nnue::{self, ParsedNetwork};
+use crate::nnue_forward;
+use std::sync::{Arc, Mutex, RwLock};
+
+// ---------------------------------------------------------------------------
+// NNUE network: loaded lazily, cached for the life of the process, and swapped
+// if the UCI `EvalFile` option changes.  If loading fails (file missing /
+// parse error), `evaluate()` transparently falls back to the hand-crafted eval.
+// ---------------------------------------------------------------------------
+
+/// Stockfish's default network file name.
+pub const DEFAULT_NNUE_FILE: &str = "nn-1a298aa575a0.nnue";
+
+/// Network path requested via UCI `setoption name EvalFile`.
+static NNUE_FILE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Cached network.  Kept behind a lock (rather than a `OnceLock`) so `EvalFile`
+/// can be changed between searches; the hot path only takes a short read lock
+/// and clones an `Arc`.
+static NNUE_NET: RwLock<NetState> = RwLock::new(NetState::NotLoaded);
+
+enum NetState {
+    NotLoaded,
+    Loaded(Arc<ParsedNetwork>),
+    Failed,
+}
+
+/// UCI `setoption name EvalFile`: request a different network.  The new file is
+/// loaded eagerly so a bad path is reported before the next search starts, and
+/// re-sending the same path is a no-op (no reload churn between games).
+pub fn set_eval_file(path: &str) {
+    let requested = match path.trim() {
+        "" | "<empty>" => None,
+        p => Some(p.to_string()),
+    };
+    {
+        let mut cur = NNUE_FILE.lock().unwrap();
+        if *cur == requested {
+            return;
+        }
+        *cur = requested;
+    }
+    // Invalidate the cache so the reload below happens even if the previous
+    // attempt failed.
+    *NNUE_NET.write().unwrap() = NetState::NotLoaded;
+    let _ = nnue_net();
+}
+
+/// Load the network now (once) instead of during the first search, so opening
+/// moves are not charged the file-read time under a clock.  Cheap afterwards.
+pub fn warm_network() {
+    let _ = nnue_net();
+}
+
+/// Locations searched when no explicit `EvalFile` was given (or it failed):
+/// environment override, next to the executable, the working directory, then
+/// the path this tree was developed at.
+fn candidate_paths() -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(p) = std::env::var("CORVUS_EVAL_FILE").ok().filter(|s| !s.is_empty()) {
+        v.push(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join(DEFAULT_NNUE_FILE).to_string_lossy().into_owned());
+        }
+    }
+    v.push(DEFAULT_NNUE_FILE.to_string());
+    v.push(format!("./{DEFAULT_NNUE_FILE}"));
+    v.push(format!("/home/avi/Documents/corvus/{DEFAULT_NNUE_FILE}"));
+    v
+}
+
+fn load_network() -> Option<ParsedNetwork> {
+    // An explicit `EvalFile` wins over the bundled locations; if it can't be
+    // loaded, say so (a bad path must not silently evaluate a *different* net)
+    // and keep going through the fallbacks.
+    if let Some(p) = NNUE_FILE.lock().unwrap().clone() {
+        match nnue::load_nnue(&p) {
+            Ok(net) => {
+                eprintln!("eval: NNUE network loaded from {p} (EvalFile)");
+                return Some(net.parsed);
+            }
+            Err(e) => eprintln!("eval: EvalFile '{p}' not usable ({e}); trying bundled locations"),
+        }
+    }
+    for p in candidate_paths() {
+        if let Ok(net) = nnue::load_nnue(&p) {
+            eprintln!("eval: NNUE network loaded from {p}");
+            return Some(net.parsed);
+        }
+    }
+    eprintln!("eval: NNUE network not found, using hand-crafted evaluation");
+    None
+}
+
+/// Returns the loaded network, or `None` if unavailable (hand-crafted fallback).
+fn nnue_net() -> Option<Arc<ParsedNetwork>> {
+    // Fast path: already resolved for the currently requested `EvalFile`.
+    if let NetState::Loaded(net) = &*NNUE_NET.read().unwrap() {
+        return Some(net.clone());
+    }
+    // Slow path: first evaluation, or `EvalFile` changed since then.
+    let mut state = NNUE_NET.write().unwrap();
+    if let NetState::NotLoaded = *state {
+        *state = match load_network() {
+            Some(net) => NetState::Loaded(Arc::new(net)),
+            None => NetState::Failed,
+        };
+    }
+    match &*state {
+        NetState::Loaded(net) => Some(net.clone()),
+        NetState::Failed | NetState::NotLoaded => None,
+    }
+}
+
+// Stockfish `PieceValue` (internal units) used for `non_pawn_material()`.
+const SF_KNIGHT_VALUE: i32 = 781;
+const SF_BISHOP_VALUE: i32 = 825;
+const SF_ROOK_VALUE: i32 = 1276;
+const SF_QUEEN_VALUE: i32 = 2538;
+
+/// Combined non-pawn, non-king material (both colors) in Stockfish internal units.
+fn non_pawn_material(b: &Board) -> i32 {
+    let knights = (b.pieces[0][KNIGHT] | b.pieces[1][KNIGHT]).count_ones() as i32;
+    let bishops = (b.pieces[0][BISHOP] | b.pieces[1][BISHOP]).count_ones() as i32;
+    let rooks = (b.pieces[0][ROOK] | b.pieces[1][ROOK]).count_ones() as i32;
+    let queens = (b.pieces[0][QUEEN] | b.pieces[1][QUEEN]).count_ones() as i32;
+    knights * SF_KNIGHT_VALUE
+        + bishops * SF_BISHOP_VALUE
+        + rooks * SF_ROOK_VALUE
+        + queens * SF_QUEEN_VALUE
+}
+
+/// Stockfish's WDL-model material metric (piece counts), used to derive the
+/// internal-units -> centipawn scale `a` via `win_rate_params`.
+fn wdl_material(b: &Board) -> i32 {
+    let pawns = (b.pieces[0][PAWN] | b.pieces[1][PAWN]).count_ones() as i32;
+    let knights = (b.pieces[0][KNIGHT] | b.pieces[1][KNIGHT]).count_ones() as i32;
+    let bishops = (b.pieces[0][BISHOP] | b.pieces[1][BISHOP]).count_ones() as i32;
+    let rooks = (b.pieces[0][ROOK] | b.pieces[1][ROOK]).count_ones() as i32;
+    let queens = (b.pieces[0][QUEEN] | b.pieces[1][QUEEN]).count_ones() as i32;
+    pawns + 3 * knights + 3 * bishops + 5 * rooks + 9 * queens
+}
+
+/// `win_rate_params(pos).a` from Stockfish's uci.cpp — the divisor that maps
+/// NNUE internal units to centipawns (`cp = round(100 * v / a)`).
+fn wdl_scale_a(b: &Board) -> f64 {
+    // Fitted model is only valid for material counts in [17, 78], anchored at 58.
+    let m = wdl_material(b).clamp(17, 78) as f64 / 58.0;
+    const AS: [f64; 4] = [-142.72052667, 372.35176398, -340.71073572, 415.23490212];
+    ((AS[0] * m + AS[1]) * m + AS[2]) * m + AS[3]
+}
 
 pub const MATE: i32 = 32000;
 
@@ -263,7 +416,52 @@ fn pinned_mask(b: &Board, side: usize) -> u64 {
     pinned
 }
 
+/// Evaluate using the NNUE network, from the side-to-move's perspective, in
+/// centipawn-scale units that match the hand-crafted evaluator's scale.
+///
+/// Reproduces Stockfish's `Eval::evaluate` pipeline (optimism term omitted as
+/// corvus has no optimism signal), then converts internal units -> centipawns.
+fn evaluate_nnue(net: &ParsedNetwork, b: &Board) -> i32 {
+    let (psqt, positional) = nnue_forward::evaluate_parts(net, b);
+    let nnue0 = psqt + positional; // internal units, side-to-move perspective
+
+    // Blend eval with NNUE complexity: nnue -= nnue * |psqt - positional| / 18236.
+    let complexity = (psqt - positional).abs() as i64;
+    let nnue = nnue0 as i64 - (nnue0 as i64 * complexity) / 18236;
+
+    // Material-proportional scaling term (optimism = 0).
+    let pawns = (b.pieces[0][PAWN] | b.pieces[1][PAWN]).count_ones() as i32;
+    let material = 534 * pawns + non_pawn_material(b);
+    let v = nnue + (nnue * material as i64) / 91000;
+
+    // Damp the evaluation linearly when shuffling (50-move rule).
+    let v = v - (v * b.half as i64) / 199;
+
+    // Convert internal units -> centipawns via Stockfish's WDL model so the value
+    // shares the hand-crafted evaluator's scale (a pawn ~ 100 cp).  Without this
+    // the NNUE output (~2.8-3.4x centipawns) would mismatch the search's
+    // centipawn-tuned pruning margins and LMR tables.
+    (100.0 * v as f64 / wdl_scale_a(b)).round() as i32
+}
+
+/// Evaluate with an explicitly provided network — the same centipawn pipeline
+/// as `evaluate()`, for callers that own their net (`nnue::NnueEval`) instead
+/// of using the process-wide cache.
+pub fn evaluate_with_net(net: &ParsedNetwork, b: &Board) -> i32 {
+    evaluate_nnue(net, b)
+}
+
+/// Public entry point: NNUE if the network is loaded, else the hand-crafted
+/// evaluation.  Both paths return a score from the side-to-move's perspective.
 pub fn evaluate(b: &Board) -> i32 {
+    match nnue_net() {
+        Some(net) => evaluate_nnue(&net, b),
+        None => evaluate_hc(b),
+    }
+}
+
+/// Original hand-crafted evaluation (fallback when the NNUE network is absent).
+fn evaluate_hc(b: &Board) -> i32 {
     let mut score = 0i32;
 
     let p = phase(&b.pieces);

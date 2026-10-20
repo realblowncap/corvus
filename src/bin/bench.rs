@@ -15,12 +15,7 @@ fn main() {
     let limits = SearchLimits {
         depth,
         movetime,
-        nodes: 0,
-        wtime: 0,
-        btime: 0,
-        winc: 0,
-        binc: 0,
-        infinite: false,
+        ..SearchLimits::default()
     };
 
     let t0 = Instant::now();

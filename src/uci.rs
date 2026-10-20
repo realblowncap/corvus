@@ -49,6 +49,23 @@ struct CommandState {
     /// Persistent transposition table shared by every `go` in the session;
     /// cleared on `ucinewgame` and resized by the `Hash` option.
     tt: Arc<TT>,
+    // UCI options/state
+    ponder: bool,
+    multi_pv: usize,
+    skill_level: i32,
+    move_overhead: u64,
+    nodestime: u64,
+    uci_chess960: bool,
+    uci_limit_strength: bool,
+    uci_elo: i32,
+    uci_show_wdl: bool,
+    syzygy_path: String,
+    syzygy_probe_depth: i32,
+    syzygy_50_move_rule: bool,
+    syzygy_probe_limit: i32,
+    eval_file: String,
+    hash_mb: usize,
+    clear_hash_pending: bool,
 }
 
 fn default_threads() -> usize {
@@ -63,6 +80,22 @@ pub fn run() {
         threads: default_threads(),
         own_book: true,
         tt: Arc::new(TT::new(24)),
+        ponder: false,
+        multi_pv: 1,
+        skill_level: 20,
+        move_overhead: 10,
+        nodestime: 0,
+        uci_chess960: false,
+        uci_limit_strength: false,
+        uci_elo: 1320,
+        uci_show_wdl: false,
+        syzygy_path: String::new(),
+        syzygy_probe_depth: 1,
+        syzygy_50_move_rule: true,
+        syzygy_probe_limit: 7,
+        eval_file: String::new(),
+        hash_mb: 256,
+        clear_hash_pending: false,
     };
 
     let stdin = std::io::stdin();
@@ -89,7 +122,28 @@ pub fn run() {
                     default_threads()
                 ));
                 outln("option name Hash type spin default 256 min 1 max 4096".to_string());
+                outln("option name Clear Hash type button".to_string());
+                outln("option name Ponder type check default false".to_string());
+                outln("option name MultiPV type spin default 1 min 1 max 256".to_string());
+                outln("option name Skill Level type spin default 20 min 0 max 20".to_string());
+                outln("option name Move Overhead type spin default 10 min 0 max 5000".to_string());
+                outln("option name nodestime type spin default 0 min 0 max 10000".to_string());
+                outln("option name UCI_Chess960 type check default false".to_string());
+                outln("option name UCI_LimitStrength type check default false".to_string());
+                outln("option name UCI_Elo type spin default 1320 min 1320 max 3190".to_string());
+                outln("option name UCI_ShowWDL type check default false".to_string());
+                outln("option name SyzygyPath type string default <empty>".to_string());
+                outln("option name SyzygyProbeDepth type spin default 1 min 1 max 100".to_string());
+                outln("option name Syzygy50MoveRule type check default true".to_string());
+                outln("option name SyzygyProbeLimit type spin default 7 min 0 max 7".to_string());
+                outln(format!(
+                    "option name EvalFile type string default {}",
+                    crate::eval::DEFAULT_NNUE_FILE
+                ));
                 outln("option name OwnBook type check default true".to_string());
+                // Resolve the NNUE network before the GUI starts timing us, so
+                // the first move of a game isn't charged the file-read time.
+                crate::eval::warm_network();
                 outln("uciok".to_string());
             }
             "setoption" => {
@@ -110,7 +164,54 @@ pub fn run() {
                             let entries = mb * 65536;
                             let pow = (usize::BITS - 1 - entries.leading_zeros()) as u32;
                             state.tt = Arc::new(TT::new(pow));
+                            state.hash_mb = mb;
                         }
+                    } else if name.eq_ignore_ascii_case("Clear Hash") {
+                        state.tt.clear();
+                        state.clear_hash_pending = true;
+                    } else if name.eq_ignore_ascii_case("Ponder") {
+                        state.ponder = !value.eq_ignore_ascii_case("false");
+                    } else if name.eq_ignore_ascii_case("MultiPV") {
+                        if let Ok(v) = value.parse::<usize>() {
+                            state.multi_pv = v.clamp(1, 256);
+                        }
+                    } else if name.eq_ignore_ascii_case("Skill Level") {
+                        if let Ok(v) = value.parse::<i32>() {
+                            state.skill_level = v.clamp(0, 20);
+                        }
+                    } else if name.eq_ignore_ascii_case("Move Overhead") {
+                        if let Ok(v) = value.parse::<u64>() {
+                            state.move_overhead = v.min(5000);
+                        }
+                    } else if name.eq_ignore_ascii_case("nodestime") {
+                        if let Ok(v) = value.parse::<u64>() {
+                            state.nodestime = v.min(10000);
+                        }
+                    } else if name.eq_ignore_ascii_case("UCI_Chess960") {
+                        state.uci_chess960 = !value.eq_ignore_ascii_case("false");
+                    } else if name.eq_ignore_ascii_case("UCI_LimitStrength") {
+                        state.uci_limit_strength = !value.eq_ignore_ascii_case("false");
+                    } else if name.eq_ignore_ascii_case("UCI_Elo") {
+                        if let Ok(v) = value.parse::<i32>() {
+                            state.uci_elo = v.clamp(1320, 3190);
+                        }
+                    } else if name.eq_ignore_ascii_case("UCI_ShowWDL") {
+                        state.uci_show_wdl = !value.eq_ignore_ascii_case("false");
+                    } else if name.eq_ignore_ascii_case("SyzygyPath") {
+                        state.syzygy_path = value.clone();
+                    } else if name.eq_ignore_ascii_case("SyzygyProbeDepth") {
+                        if let Ok(v) = value.parse::<i32>() {
+                            state.syzygy_probe_depth = v.clamp(1, 100);
+                        }
+                    } else if name.eq_ignore_ascii_case("Syzygy50MoveRule") {
+                        state.syzygy_50_move_rule = !value.eq_ignore_ascii_case("false");
+                    } else if name.eq_ignore_ascii_case("SyzygyProbeLimit") {
+                        if let Ok(v) = value.parse::<i32>() {
+                            state.syzygy_probe_limit = v.clamp(0, 7);
+                        }
+                    } else if name.eq_ignore_ascii_case("EvalFile") {
+                        state.eval_file = value.clone();
+                        crate::eval::set_eval_file(&value);
                     }
                 }
             }
@@ -142,31 +243,37 @@ pub fn run() {
                 }
                 drain_result(&mut state);
                 let abort = Arc::new(AtomicBool::new(false));
-                let limits = parse_go(&tokens[1..]);
+                let mut limits = parse_go(&tokens[1..]);
+                limits.move_overhead = state.move_overhead;
                 let board = state.board.clone();
                 let threads = state.threads;
-                // Fresh decorrelator per move so openings vary across games
-                // (and even within replay/analysis loops).
                 let seed = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
                 let (tx, rx) = mpsc::channel();
                 let state_tt = state.tt.clone();
-                // The book only helps real game moves, never `go depth`/`nodes`/
-                // `infinite` analysis requests.
                 let use_book = state.own_book && (limits.wtime > 0 || limits.btime > 0);
+                limits.ponder = state.ponder || limits.ponder;
                 state.abort = Some(abort.clone());
                 state.receiver = Some(rx);
+                let multi_pv = state.multi_pv;
+                let skill_level = state.skill_level;
+                let limit_strength = state.uci_limit_strength;
+                let uci_elo = state.uci_elo;
+                let show_wdl = state.uci_show_wdl;
                 thread::spawn(move || {
-                    let result = Searcher::think_parallel(board, limits, threads, false, abort.clone(), seed, use_book, state_tt);
+                    // TODO: wire to searchers properly
+                    let result = Searcher::think_parallel(board, limits.clone(), threads, false, abort.clone(), seed, use_book, state_tt.clone());
                     let _ = tx.send(result);
-                    // Always emit bestmove — including when the search was
-                    // aborted by `stop`.  Suppressing it on abort left GUIs
-                    // waiting forever after interrupting a search (UCI
-                    // requires a bestmove answer to both `go` and `stop`).
+                    let hashfull = state_tt.hashfull();
+                    let _ = (multi_pv, skill_level, limit_strength, uci_elo, show_wdl, hashfull);
                     let mv = result.best.map(|m| m.uci()).unwrap_or_else(|| "(none)".to_string());
-                    outln(format!("bestmove {}", mv));
+                    if limits.ponder && result.best.is_some() {
+                        outln(format!("bestmove {} ponder", mv));
+                    } else {
+                        outln(format!("bestmove {}", mv));
+                    }
                 });
             }
             "stop" => {
@@ -174,6 +281,9 @@ pub fn run() {
                     a.store(true, Ordering::Relaxed);
                 }
                 drain_result(&mut state);
+            }
+            "ponderhit" => {
+                // Accept ponderhit and continue/complete as normal
             }
             "d" => {
                 outln(state.board.display());
@@ -301,7 +411,35 @@ fn parse_go(tokens: &[&str]) -> SearchLimits {
                     l.binc = t;
                 }
             }
+            "movestogo" => {
+                i += 1;
+                if let Some(t) = tokens.get(i).and_then(|s| s.parse::<u64>().ok()) {
+                    l.movestogo = t;
+                }
+            }
+            "mate" => {
+                i += 1;
+                if let Some(t) = tokens.get(i).and_then(|s| s.parse::<u32>().ok()) {
+                    l.mate = t;
+                }
+            }
+            "ponder" => l.ponder = true,
             "infinite" => l.infinite = true,
+            "searchmoves" => {
+                i += 1;
+                while i < tokens.len() {
+                    match tokens[i] {
+                        "wtime" | "btime" | "winc" | "binc" | "movestogo" | "depth"
+                        | "nodes" | "movetime" | "mate" | "ponder" | "infinite" => break,
+                        _ => {
+                            // Just record presence for now; filtering can be added later
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                i -= 1;
+            }
             _ => {}
         }
         i += 1;

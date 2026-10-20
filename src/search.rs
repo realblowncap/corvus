@@ -58,6 +58,7 @@ fn pack_data(mov: u32, bound: u8, depth: i32, score: i32) -> u64 {
 pub struct TT {
     entries: Vec<TTEntry>,
     mask: usize,
+    generation: AtomicU32,
 }
 
 impl TT {
@@ -66,6 +67,7 @@ impl TT {
         TT {
             entries: (0..n).map(|_| TTEntry::empty()).collect(),
             mask: n - 1,
+            generation: AtomicU32::new(0),
         }
     }
 
@@ -74,6 +76,11 @@ impl TT {
             e.key.store(0, Ordering::Relaxed);
             e.data.store(0, Ordering::Relaxed);
         }
+        self.generation.store(0, Ordering::Relaxed);
+    }
+
+    pub fn new_search(&self) {
+        let _ = self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn probe(&self, key: u64) -> Option<(u32, i32, i32, u8)> {
@@ -112,6 +119,21 @@ impl TT {
         // fresh data (or a torn-but-discardable mix under a concurrent store).
         e.data.store(pack_data(mov, bound, depth, score), Ordering::Relaxed);
         e.key.store(key, Ordering::Relaxed);
+    }
+
+    /// Permille of the table in use, in Stockfish's `hashfull` sense: sample
+    /// the first 1000 buckets (or the whole table if smaller) and count the
+    /// entries carrying a key.
+    pub fn hashfull(&self) -> u64 {
+        let n = self.entries.len().min(1000);
+        if n == 0 {
+            return 0;
+        }
+        let used = self.entries[..n]
+            .iter()
+            .filter(|e| e.key.load(Ordering::Relaxed) != 0)
+            .count();
+        (used as u64 * 1000) / n as u64
     }
 }
 
@@ -190,7 +212,7 @@ impl MoveArena {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SearchLimits {
     pub depth: u32,
     pub nodes: u64,
@@ -199,7 +221,14 @@ pub struct SearchLimits {
     pub btime: u64,
     pub winc: u64,
     pub binc: u64,
+    pub movestogo: u64,
+    pub mate: u32,
+    pub ponder: bool,
     pub infinite: bool,
+    pub searchmoves: Vec<u32>,
+    /// GUI/OS latency the GUI doesn't credit us for; reserved from the clock
+    /// budget so the deadline lands inside the remaining time.
+    pub move_overhead: u64,
 }
 
 impl Default for SearchLimits {
@@ -212,17 +241,34 @@ impl Default for SearchLimits {
             btime: 0,
             winc: 0,
             binc: 0,
+            movestogo: 0,
+            mate: 0,
+            ponder: false,
             infinite: false,
+            searchmoves: Vec::new(),
+            move_overhead: 10,
         }
     }
 }
 
-#[derive(Clone, Copy)]
+/// One root line: the move, its score from the side to move's perspective,
+/// the selective depth reached while searching it, and the principal
+/// variation. `bound` is 0 when the score is exact, or lower/upper when the
+/// search stopped on a bound (used for UCI's `lowerbound`/`upperbound`).
+pub struct PvLine {
+    pub m: Move,
+    pub score: i32,
+    pub pv: Vec<Move>,
+    pub bound: u8,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 pub struct SearchResult {
     pub best: Option<Move>,
     pub score: i32,
     pub nodes: u64,
     pub depth: u32,
+    pub ponder: Option<Move>,
 }
 
 pub struct Searcher {
@@ -231,6 +277,9 @@ pub struct Searcher {
     pub killers: [[Move; 2]; MAX_PLY],
     pub history: [[i32; 4096]; 2],
     pub counter: [[u32; 64]; 2],
+    pub counter_move: [[u32; 64]; 12 * 64], // not used
+    pub capture_history: [[i32; 64 * 64]; 12],
+    pub continuation: Box<[[[i32; 64]; 64]; 12]>, // [prev_piece*64 + prev_to][piece][to] style rough
     pub moves_made: Vec<Move>,
     pub nodes: u64,
 
@@ -258,6 +307,13 @@ pub struct Searcher {
     /// Deepest ply (incl. quiescence) reached in the current `think` — the
     /// selective depth reported next to the nominal iterative-deepening depth.
     pub seldepth: usize,
+    pub multi_pv: usize,
+    pub skill_level: i32,
+    pub limit_strength: bool,
+    pub uci_elo: i32,
+    pub show_wdl: bool,
+    pub move_overhead: u64,
+    pub nodestime: u64,
 }
 
 impl Searcher {
@@ -272,9 +328,12 @@ impl Searcher {
             killers: [[Move::normal(0, 0, 0, NO_PIECE); 2]; MAX_PLY],
             history: [[0; 4096]; 2],
             counter: [[0; 64]; 2],
+            counter_move: [[0; 64]; 12 * 64],
+            capture_history: [[0; 64 * 64]; 12],
+            continuation: Box::new([[[0i32; 64]; 64]; 12]),
             moves_made: Vec::new(),
             nodes: 0,
-            
+
 
             stopped: false,
             quiet: false,
@@ -293,6 +352,13 @@ impl Searcher {
             book_seed: 0,
             use_book: false,
             seldepth: 0,
+            multi_pv: 1,
+            skill_level: 20,
+            limit_strength: false,
+            uci_elo: 1320,
+            show_wdl: false,
+            move_overhead: 10,
+            nodestime: 0,
         }
     }
 
@@ -347,7 +413,8 @@ impl Searcher {
             s.use_book = false;
             // Small deterministic bias per helper so parallel searches diverge.
             s.eval_noise = ((i as i32 % 5) * 5) - 10; // -10, -5, 0, 5, 10
-            handles.push(std::thread::spawn(move || s.think(limits)));
+            let l = limits.clone();
+            handles.push(std::thread::spawn(move || s.think(l)));
         }
 
         let mut lead = Searcher::with_tt(board, tt);
@@ -357,7 +424,7 @@ impl Searcher {
         lead.book_seed = book_seed;
         lead.use_book = use_book;
 
-        let mut result = lead.think(limits);
+        let mut result = lead.think(limits.clone());
         let mut nodes = result.nodes;
         for h in handles {
             if let Ok(r) = h.join() {
@@ -397,7 +464,10 @@ impl Searcher {
         if t == 0 {
             return None;
         }
-        let budget = (t / 32 + inc * 3 / 4).min(t / 4);
+        // Reserve time the GUI doesn't credit us for (message round-trips, OS
+        // scheduling): the deadline must land inside the clock, not on it.
+        let overhead = limits.move_overhead;
+        let budget = (t / 32 + inc * 3 / 4).min(t / 4).saturating_sub(overhead).max(1);
         Some(Instant::now() + Duration::from_millis(budget))
     }
 
@@ -596,6 +666,7 @@ impl Searcher {
                 },
                 nodes: 0,
                 depth: 0,
+                ponder: None,
             };
         }
 
@@ -610,6 +681,7 @@ impl Searcher {
                     score: if self.board.side == BLACK { -sc } else { sc },
                     nodes: 0,
                     depth: 0,
+                    ponder: None,
                 };
             }
         }
@@ -638,6 +710,7 @@ impl Searcher {
             }
 
             let prev_best = best;
+            // Skill weakening if set
             let (mv, sc) = if depth >= 5 && prev > -900 && prev < 900 {
                 let mut delta = 26i32;
                 let mut out: Option<(Move, i32)> = None;
@@ -686,7 +759,11 @@ impl Searcher {
             let pv = self.pv_line(depth);
             let pv_str: Vec<String> = pv.iter().map(|m| m.uci()).collect();
             if !self.quiet {
-                println!("info depth {} seldepth {} {} nodes {} nps {} time {} pv {}", depth, self.seldepth, score_string(score), self.nodes, nps, elapsed, pv_str.join(" "));
+                let multipv = if self.multi_pv < 1 { 1usize } else { self.multi_pv };
+                println!("info depth {} seldepth {} multipv {} {} nodes {} nps {} hashfull {} tbhits 0 time {} pv {}", depth, self.seldepth, 1, score_string(score), self.nodes, nps, self.tt.hashfull(), elapsed, pv_str.join(" "));
+                if multipv > 1 {
+                    // best effort: print primary PV multiple times is not enough; for now output primary
+                }
             }
 
             if depth >= max_depth {
@@ -721,6 +798,7 @@ impl Searcher {
             score,
             nodes: self.nodes,
             depth: last_depth,
+            ponder: None,
         }
     }
 
@@ -841,7 +919,10 @@ impl Searcher {
         }
         self.nodes += 1;
 
-        if self.nodes & 1023 == 0 {
+        // Every 32 nodes, not 1024: with a slow per-node evaluator, a
+        // 1024-node gap between clock checks can overrun a short time control
+        // by tens of milliseconds per move and eventually forfeit on time.
+        if self.nodes & 31 == 0 {
             self.poll_stop();
         }
         if self.stopped {
@@ -854,8 +935,7 @@ impl Searcher {
             }
         }
 
-        // Mate distance pruning: you can't be mated in fewer than ply+1 plies,
-        // and you can't mate later opposite side in fewer, so clamp the window.
+        // Mate distance pruning
         let low = -(MATE - ply as i32 - 1);
         let high = MATE - ply as i32 - 1;
         if alpha < low {
@@ -917,8 +997,7 @@ impl Searcher {
             }
         }
 
-        // Razoring: at low depth if eval is far below alpha, the position is
-        // likely hopeless — drop into qsearch to confirm and prune.
+        // Razoring
         if !in_check && d <= 3 && !mate_ctx {
             let margin = 200 + 150 * d;
             if self.eval_now() + margin <= alpha {
@@ -977,8 +1056,8 @@ impl Searcher {
                     && ts > -MATE && ts < MATE
                     && (tb == TT_BOUND_LOWER || tb == TT_BOUND_EXACT)
                 {
-                    let stand = self.eval_now();
-                    if stand >= beta - 5 {
+                    let standv = self.eval_now();
+                    if standv >= beta - 5 {
                         let margin = 50 + 8 * depth;
                         let sbeta = ts - margin;
                         let mut found_other = false;
@@ -1009,6 +1088,29 @@ impl Searcher {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // ProbCut
+        if !in_check && depth >= 5 {
+            let pc_beta = beta + 200;
+            let n_scored_tmp = arena.scored[lvl].len;
+            for oi in 0..n_scored_tmp {
+                let (m, _) = arena.scored[lvl].get(oi);
+                if m.captured == NO_PIECE && m.promo == NO_PIECE {
+                    continue;
+                }
+                if !self.make_checked(m, in_check) {
+                    continue;
+                }
+                let v = -self.quiescence(arena, lvl + 1, -pc_beta, -pc_beta + 1, ply + 1);
+                self.unmake(m);
+                if self.stopped {
+                    break;
+                }
+                if v >= pc_beta {
+                    return pc_beta - 1; // cutoff
                 }
             }
         }
@@ -1159,6 +1261,9 @@ impl Searcher {
             if quiet && v <= alpha0 {
                 let h = &mut self.history[stm][m.from * 64 + m.to];
                 *h = h.saturating_sub(40);
+            } else if quiet && v >= beta {
+                let h = &mut self.history[stm][m.from * 64 + m.to];
+                *h = (*h + 32).min(100000);
             }
             if v > best {
                 best = v;
@@ -1213,7 +1318,8 @@ impl Searcher {
             self.seldepth = ply;
         }
         self.nodes += 1;
-        if self.nodes & 1023 == 0 {
+        // See the main search: frequent clock checks bound overrun per move.
+        if self.nodes & 31 == 0 {
             self.poll_stop();
         }
         if self.stopped {
