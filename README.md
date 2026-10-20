@@ -6,16 +6,6 @@
 
 A free and strong UCI chess engine.
 
-  <br>
-  <strong>[Explore Corvus docs »][wiki-link]</strong>
-  <br>
-  <br>
-  [Report bug][issue-link]
-  ·
-  [Open a discussion][discussions-link]
-  ·
-  [Changelog][releases-link]
-
   [![License][license-badge]][license-link]
   [![Release][release-badge]][releases-link]
   <br>
