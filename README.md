@@ -4,7 +4,7 @@
 
 # Corvus
 
-A free and strong UCI chess engine.
+A solo developed, good UCI chess engine.
 
   [![License][license-badge]][license-link]
   [![Release][release-badge]][releases-link]
