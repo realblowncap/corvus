@@ -25,5 +25,6 @@ pub mod nnue_forward;
 pub mod perft;
 pub mod san;
 pub mod search;
+pub mod syzygy;
 pub mod uci;
 pub mod wdl;

@@ -144,11 +144,29 @@ pub fn run() {
                 // Resolve the NNUE network before the GUI starts timing us, so
                 // the first move of a game isn't charged the file-read time.
                 crate::eval::warm_network();
+                // Auto-load tablebases from the conventional locations so
+                // Syzygy works with zero GUI setup.  An explicit `SyzygyPath`
+                // (or CORVUS_SYZYGY_PATH) still takes priority.
+                if state.syzygy_path.trim().is_empty() {
+                    if let Some(dir) = crate::syzygy::discover_default() {
+                        let largest = crate::syzygy::max_pieces();
+                        state.syzygy_path = dir.clone();
+                        eprintln!("info string Syzygy tablebases up to {largest} pieces from {dir}");
+                    }
+                }
                 outln("uciok".to_string());
             }
             "setoption" => {
                 if let Some(vpos) = tokens.iter().position(|&t| t == "value") {
-                    let name = tokens[1..vpos].join(" ");
+                    // `setoption name <NAME> value <VALUE>`: skip the literal
+                    // `name` keyword, otherwise every lookup below would compare
+                    // against "name Hash" and never match.
+                    let name_start = if tokens.get(1) == Some(&"name") { 2 } else { 1 };
+                    let name = if name_start <= vpos {
+                        tokens[name_start..vpos].join(" ")
+                    } else {
+                        String::new()
+                    };
                     let value = tokens.get(vpos + 1).map(|s| s.to_string()).unwrap_or_default();
                     if name.eq_ignore_ascii_case("Threads") {
                         if let Ok(v) = value.parse::<usize>() {
@@ -199,6 +217,42 @@ pub fn run() {
                         state.uci_show_wdl = !value.eq_ignore_ascii_case("false");
                     } else if name.eq_ignore_ascii_case("SyzygyPath") {
                         state.syzygy_path = value.clone();
+                        // Load now rather than at the first probe, so a bad path
+                        // is reported to the GUI instead of silently costing
+                        // endgame strength.
+                        if state.syzygy_path.trim().is_empty() {
+                            // Empty disables probing for this session (Fathom
+                            // cannot unload tables that are already mapped).
+                            eprintln!("info string SyzygyProbe disabled (empty SyzygyPath)");
+                        } else if let Some(already) = crate::syzygy::loaded_path() {
+                            if already != state.syzygy_path {
+                                // A startup auto-load already pinned Fathom to a
+                                // different directory.  Say so instead of
+                                // pretending the new path was applied.
+                                eprintln!(
+                                    "info string SyzygyPath '{0}' ignored: '{1}' already loaded \
+                                     (tablebases cannot be reloaded in-process)",
+                                    state.syzygy_path, already
+                                );
+                                state.syzygy_path = already;
+                            } else {
+                                let largest = crate::syzygy::max_pieces();
+                                eprintln!("info string Syzygy tablebases up to {largest} pieces");
+                            }
+                        } else {
+                            let largest = crate::syzygy::init(&state.syzygy_path);
+                            if largest == 0 {
+                                eprintln!(
+                                    "info string SyzygyPath '{}' loaded no tablebases",
+                                    state.syzygy_path
+                                );
+                            } else {
+                                eprintln!(
+                                    "info string Syzygy tablebases up to {largest} pieces from {}",
+                                    state.syzygy_path
+                                );
+                            }
+                        }
                     } else if name.eq_ignore_ascii_case("SyzygyProbeDepth") {
                         if let Ok(v) = value.parse::<i32>() {
                             state.syzygy_probe_depth = v.clamp(1, 100);
@@ -245,6 +299,10 @@ pub fn run() {
                 let abort = Arc::new(AtomicBool::new(false));
                 let mut limits = parse_go(&tokens[1..]);
                 limits.move_overhead = state.move_overhead;
+                limits.syzygy_path = state.syzygy_path.clone();
+                limits.syzygy_probe_depth = state.syzygy_probe_depth;
+                limits.syzygy_probe_limit = state.syzygy_probe_limit.max(0) as u32;
+                limits.syzygy_50_move_rule = state.syzygy_50_move_rule;
                 let board = state.board.clone();
                 let threads = state.threads;
                 let seed = SystemTime::now()

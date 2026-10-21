@@ -28,6 +28,12 @@ use std::time::{Duration, Instant};
 pub const INF: i32 = MATE + 1000;
 pub const DRAW: i32 = 0;
 
+/// Score used for a tablebase win/loss.  High enough to dominate any normal
+/// evaluation, but deliberately *below* the mate-reporting window
+/// (`MATE - 200`) so a tablebase result is never printed as "mate N": DTZ is
+/// not the mate distance.
+pub const TB_WIN_SCORE: i32 = MATE - 1000;
+
 const MAX_PLY: usize = 128;
 const TT_BOUND_NONE: u8 = 0;
 const TT_BOUND_LOWER: u8 = 1;
@@ -229,6 +235,11 @@ pub struct SearchLimits {
     /// GUI/OS latency the GUI doesn't credit us for; reserved from the clock
     /// budget so the deadline lands inside the remaining time.
     pub move_overhead: u64,
+    /// Syzygy tablebase configuration, copied from the UCI options.
+    pub syzygy_path: String,
+    pub syzygy_probe_depth: i32,
+    pub syzygy_probe_limit: u32,
+    pub syzygy_50_move_rule: bool,
 }
 
 impl Default for SearchLimits {
@@ -247,6 +258,10 @@ impl Default for SearchLimits {
             infinite: false,
             searchmoves: Vec::new(),
             move_overhead: 10,
+            syzygy_path: String::new(),
+            syzygy_probe_depth: 1,
+            syzygy_probe_limit: 7,
+            syzygy_50_move_rule: true,
         }
     }
 }
@@ -271,6 +286,30 @@ pub struct SearchResult {
     pub ponder: Option<Move>,
 }
 
+/// Syzygy probing configuration, copied into the searcher at `think` time.
+#[derive(Clone, Copy)]
+pub struct TbConfig {
+    /// Whether any tablebases are loaded at all (`SyzygyPath` was usable).
+    pub enabled: bool,
+    /// Do not probe shallower than this depth (`SyzygyProbeDepth`).
+    pub probe_depth: i32,
+    /// Maximum piece count to probe; 0 disables probing (`SyzygyProbeLimit`).
+    pub probe_limit: u32,
+    /// Honour the 50-move rule when interpreting cursed wins (`Syzygy50MoveRule`).
+    pub use_50move: bool,
+}
+
+impl Default for TbConfig {
+    fn default() -> Self {
+        TbConfig {
+            enabled: false,
+            probe_depth: 1,
+            probe_limit: 7,
+            use_50move: true,
+        }
+    }
+}
+
 pub struct Searcher {
     pub board: Board,
     pub tt: Arc<TT>,
@@ -282,6 +321,8 @@ pub struct Searcher {
     pub continuation: Box<[[[i32; 64]; 64]; 12]>, // [prev_piece*64 + prev_to][piece][to] style rough
     pub moves_made: Vec<Move>,
     pub nodes: u64,
+    /// Successful Syzygy probes (root + in-search), reported as `tbhits`.
+    pub tb_hits: u64,
 
 
     pub stopped: bool,
@@ -293,6 +334,7 @@ pub struct Searcher {
     pub key_stack: Vec<u64>,
     pub irr_boundary: Vec<bool>,
     pub null_ep: Vec<Option<usize>>,
+    pub tb_conf: TbConfig,
     pub eval_cache_key: u64,
     pub eval_cache_val: i32,
     eval_hat: EvalHat,
@@ -333,6 +375,7 @@ impl Searcher {
             continuation: Box::new([[[0i32; 64]; 64]; 12]),
             moves_made: Vec::new(),
             nodes: 0,
+            tb_hits: 0,
 
 
             stopped: false,
@@ -344,6 +387,7 @@ impl Searcher {
             key_stack: Vec::new(),
             irr_boundary: Vec::new(),
             null_ep: Vec::new(),
+            tb_conf: TbConfig::default(),
             eval_cache_key: u64::MAX,
             eval_cache_val: 0,
             eval_hat: EvalHat::new(1 << 20),
@@ -380,6 +424,16 @@ impl Searcher {
         self.eval_cache_key = self.board.key;
         self.eval_cache_val = v;
         v + self.eval_noise
+    }
+
+    /// Noise-free static evaluation, for paths whose *value* can escape this
+    /// node: prune/fail-high returns and qsearch stand-pat cutoffs.  Helpers
+    /// still diverge through ordering and root selection, but they must not
+    /// store bounds derived from `eval_noise` into the table the lead thread
+    /// then trusts (that leaks a per-thread ±10cp error into every shared
+    /// cutoff).
+    fn eval_clean(&mut self) -> i32 {
+        self.eval_now() - self.eval_noise
     }
 
     /// Lazy SMP: run `threads` searches on the same root, sharing `tt`.
@@ -537,8 +591,13 @@ impl Searcher {
     }
 
     fn rep_occurred(&self) -> bool {
+        // `key_stack[i]` is the position *after* the i-th move (pushed post-make),
+        // so `key_stack[n-1]` == the current position, and history worth scanning
+        // runs from `n-2` down to the last irreversible move at `i` *inclusive*:
+        // irreversibility reset the move history, but the position right after
+        // that move can still recur and must be counted.
         let n = self.key_stack.len();
-        if n == 0 {
+        if n < 2 {
             return false;
         }
         let mut i = n;
@@ -549,10 +608,19 @@ impl Searcher {
             }
         }
         let mut j = n - 1;
-        while j > i {
+        loop {
+            // Never step below index 0: when the irreversible boundary *is* the
+            // last entry (`i == n - 1`) there is nothing to scan, and an
+            // unbounded `j -= 1` would wrap to `usize::MAX` and panic.
+            if j == 0 {
+                break;
+            }
             j -= 1;
             if self.key_stack[j] == self.board.key {
                 return true;
+            }
+            if j == i {
+                break;
             }
         }
         false
@@ -648,6 +716,12 @@ impl Searcher {
     }
 
     pub fn think(&mut self, limits: SearchLimits) -> SearchResult {
+        self.tb_conf = TbConfig {
+            enabled: !limits.syzygy_path.trim().is_empty() && crate::syzygy::max_pieces() > 0,
+            probe_depth: limits.syzygy_probe_depth.max(0),
+            probe_limit: limits.syzygy_probe_limit,
+            use_50move: limits.syzygy_50_move_rule,
+        };
         self.deadline = Searcher::deadline(&limits, self.board.side);
         self.nodes_limit = if limits.nodes > 0 { limits.nodes } else { u64::MAX };
         let max_depth = if limits.depth > 0 { limits.depth as usize } else { 128 };
@@ -686,6 +760,48 @@ impl Searcher {
             }
         }
 
+        // Root tablebase probe.  Only a *decisive* result short-circuits the
+        // search: for a draw, normal search still chooses among the drawing
+        // moves (which is both stronger and avoids TB-shuffle draws).  Skipped
+        // when the GUI restricted the move list.
+        if limits.searchmoves.is_empty() && !limits.syzygy_path.trim().is_empty() {
+            if let Some((tb_move, wdl, dtz)) = crate::syzygy::probe_root(
+                &self.board,
+                limits.syzygy_probe_limit,
+                limits.syzygy_50_move_rule,
+            ) {
+                self.tb_hits += 1;
+                if wdl == crate::syzygy::TB_WIN || wdl == crate::syzygy::TB_LOSS {
+                    // Report a large cp advantage rather than a mate: DTZ counts
+                    // plies to the next zeroing move (pawn move, capture, or
+                    // mate), which is *not* the mate distance, and converting it
+                    // into `MATE - n` would make the GUI print a fake "mate N"
+                    // line for positions thousands of plies from mate.  Staying
+                    // below the mate window also keeps `score_string` honest.
+                    let tb_score = if wdl == crate::syzygy::TB_WIN {
+                        TB_WIN_SCORE
+                    } else {
+                        -TB_WIN_SCORE
+                    };
+                    if !self.quiet {
+                        outln(format!(
+                            "info depth 1 seldepth 1 score cp {} pv {}",
+                            if self.board.side == BLACK { -tb_score } else { tb_score },
+                            tb_move.uci()
+                        ));
+                        outln(format!("info string tb root wdl {} dtz {}", wdl, dtz));
+                    }
+                    return SearchResult {
+                        best: Some(tb_move),
+                        score: if self.board.side == BLACK { -tb_score } else { tb_score },
+                        nodes: self.nodes,
+                        depth: 0,
+                        ponder: None,
+                    };
+                }
+            }
+        }
+
         let mut best: Option<Move> = None;
         let mut score = 0i32;
         let mut last_depth = 0u32;
@@ -718,22 +834,38 @@ impl Searcher {
                     let alpha = prev - delta;
                     let beta = prev + delta;
                     let (mm, ss) = self.search_root_arena(&mut arena, depth as i32, alpha, beta);
+                    // An aborted iteration yields no move: propagate `None` out
+                    // of the aspiration loop instead of spinning on it.
+                    let mm = match mm {
+                        Some(m) => m,
+                        None => break,
+                    };
                     if self.stopped || (ss > alpha && ss < beta) {
                         out = Some((mm, ss));
                     } else {
                         delta += delta / 2 + 1;
                         if delta > 300 {
-                            out = Some(self.search_root_arena(&mut arena, depth as i32, -INF, INF));
+                            let (fm, fs) =
+                                self.search_root_arena(&mut arena, depth as i32, -INF, INF);
+                            out = fm.map(|m| (m, fs));
                         }
                     }
                 }
-                out.unwrap()
+                match out {
+                    Some((m, s)) => (Some(m), s),
+                    None => (None, prev),
+                }
             } else {
                 self.search_root_arena(&mut arena, depth as i32, -INF, INF)
             };
             if self.stopped {
                 break;
             }
+            // A partial iteration searched no move: keep the previous result.
+            let mv = match mv {
+                Some(m) => m,
+                None => break,
+            };
             // Age history table to focus on recent search results
             for side in 0..2 {
                 for h in self.history[side].iter_mut() {
@@ -760,7 +892,7 @@ impl Searcher {
             let pv_str: Vec<String> = pv.iter().map(|m| m.uci()).collect();
             if !self.quiet {
                 let multipv = if self.multi_pv < 1 { 1usize } else { self.multi_pv };
-                println!("info depth {} seldepth {} multipv {} {} nodes {} nps {} hashfull {} tbhits 0 time {} pv {}", depth, self.seldepth, 1, score_string(score), self.nodes, nps, self.tt.hashfull(), elapsed, pv_str.join(" "));
+                println!("info depth {} seldepth {} multipv {} {} nodes {} nps {} hashfull {} tbhits {} time {} pv {}", depth, self.seldepth, 1, score_string(score), self.nodes, nps, self.tt.hashfull(), self.tb_hits, elapsed, pv_str.join(" "));
                 if multipv > 1 {
                     // best effort: print primary PV multiple times is not enough; for now output primary
                 }
@@ -785,10 +917,23 @@ impl Searcher {
         }
 
         if best.is_none() {
-            if root_moves.is_empty() {
-                best = None;
-            } else {
-                best = Some(root_moves.as_slice()[0]);
+            // No iteration ever completed (e.g. the clock expired during depth 1
+            // with a slow evaluator). Play something legal and ordered rather
+            // than the raw first generated move, which is arbitrary.
+            let tt_mov = self.tt.probe(self.board.key).map(|e| e.0);
+            let mut ordered = ScoredMoveList::new();
+            self.score_moves_into(&mut ordered, self.board.side, &root_moves, tt_mov, 0, None);
+            let mut chosen: Option<Move> = None;
+            for (m, _) in ordered.iter() {
+                let mut probe = self.board.clone();
+                let was_in_check = probe.in_check(probe.side);
+                if probe.make_checked(m, was_in_check) {
+                    chosen = Some(m);
+                    break;
+                }
+            }
+            if let Some(m) = chosen {
+                best = Some(m);
                 score = DRAW;
             }
         }
@@ -804,7 +949,7 @@ impl Searcher {
 
     /// Search the root position once. Convenience wrapper that allocates a
     /// fresh move arena; `think` reuses one across iterations for speed.
-    pub fn search_root(&mut self, depth: i32, alpha: i32, beta: i32) -> (Move, i32) {
+    pub fn search_root(&mut self, depth: i32, alpha: i32, beta: i32) -> (Option<Move>, i32) {
         let mut arena = MoveArena::new();
         self.search_root_arena(&mut arena, depth, alpha, beta)
     }
@@ -815,7 +960,7 @@ impl Searcher {
         depth: i32,
         mut alpha: i32,
         beta: i32,
-    ) -> (Move, i32) {
+    ) -> (Option<Move>, i32) {
         let alpha0 = alpha;
         arena.reserve(0);
         let mut list = MoveList::new();
@@ -825,10 +970,14 @@ impl Searcher {
         self.score_moves_into(&mut ordered, self.board.side, &list, tt_mov, 0, None);
 
         let mut best = -INF;
-        // Fallback PV move if the search stops before any move is searched.
-        let mut best_move = ordered.first_mov();
+        // Seed with an actual searched move, never with the ordering-first move:
+        // if the clock aborts the iteration before the first `v > best`, a bogus
+        // fallback here would become the played move (see the `had_move` guard).
+        let mut best_move = Move::normal(0, 0, 0, NO_PIECE);
         let mut fail_high = false;
 
+        // True once some move has been searched to a score in this iteration.
+        let mut had_move = false;
         let mut first = true;
         let mut legal_count = 0usize;
         for (m, _) in ordered.iter() {
@@ -864,9 +1013,10 @@ impl Searcher {
             if self.stopped {
                 break;
             }
-            if v > best {
+            if !had_move || v > best {
                 best = v;
                 best_move = m;
+                had_move = true;
             }
             if best > alpha {
                 alpha = best;
@@ -883,6 +1033,7 @@ impl Searcher {
             } else {
                 DRAW
             };
+            had_move = true;
         }
         if !self.stopped {
             let bound = if fail_high {
@@ -900,7 +1051,10 @@ impl Searcher {
                 bound,
             );
         }
-        (best_move, best)
+        // An aborted iteration must not declare a move it never searched; the
+        // caller uses `None` to mean "keep the previous iteration's move".
+        let out = if had_move { Some(best_move) } else { None };
+        (out, best)
     }
 
     fn negamax(
@@ -932,6 +1086,47 @@ impl Searcher {
         if ply > 0 {
             if self.board.half >= 100 || self.rep_occurred() {
                 return DRAW;
+            }
+        }
+
+        // Syzygy WDL probe.  A tablebase result is exact, so it can be returned
+        // immediately; only probe at sufficient depth (the option exists to keep
+        // the cost down) and inside the loaded piece limit.
+        if self.tb_conf.enabled
+            && self.tb_conf.probe_limit > 0
+            && (depth as i32) >= self.tb_conf.probe_depth
+        {
+            let tb_probe = crate::syzygy::probe_wdl(&self.board, self.tb_conf.probe_limit);
+            if tb_probe.is_some() {
+                self.tb_hits += 1;
+            }
+            let tb_value = match tb_probe {
+                // 50-move handling: `Syzygy50MoveRule=true` means a cursed win
+                // (win in material, but not within 50 moves) is only a draw, so
+                // the engine must not believe it is winning.  With the rule
+                // disabled those positions count as real wins/losses.
+                Some(crate::syzygy::TB_WIN) => Some(TB_WIN_SCORE),
+                Some(crate::syzygy::TB_LOSS) => Some(-TB_WIN_SCORE),
+                Some(crate::syzygy::TB_CURSED_WIN) => Some(if self.tb_conf.use_50move {
+                    DRAW
+                } else {
+                    TB_WIN_SCORE
+                }),
+                Some(crate::syzygy::TB_BLESSED_LOSS) => Some(if self.tb_conf.use_50move {
+                    DRAW
+                } else {
+                    -TB_WIN_SCORE
+                }),
+                Some(_) => Some(DRAW),
+                None => None,
+            };
+            if let Some(tb_value) = tb_value {
+                if tb_value >= beta {
+                    return tb_value;
+                }
+                if tb_value > alpha {
+                    alpha = tb_value;
+                }
             }
         }
 
@@ -990,7 +1185,9 @@ impl Searcher {
         generate_pseudo(&self.board, &mut arena.raw[lvl]);
 
         if !in_check && alpha + 1 == beta && d <= 10 {
-            let stand = self.eval_now();
+            // Noise-free: a fail-high here returns `stand` straight to the
+            // parent, so a noised value would be stored as a real TT bound.
+            let stand = self.eval_clean();
             let margin = 60 + 60 * d;
             if stand >= beta + margin && stand < MATE - 500 && stand > -MATE + 500 {
                 return stand;
@@ -1000,7 +1197,7 @@ impl Searcher {
         // Razoring
         if !in_check && d <= 3 && !mate_ctx {
             let margin = 200 + 150 * d;
-            if self.eval_now() + margin <= alpha {
+            if self.eval_clean() + margin <= alpha {
                 let v = self.quiescence(arena, lvl + 1, alpha, beta, ply);
                 if v <= alpha {
                     return v;
@@ -1056,7 +1253,7 @@ impl Searcher {
                     && ts > -MATE && ts < MATE
                     && (tb == TT_BOUND_LOWER || tb == TT_BOUND_EXACT)
                 {
-                    let standv = self.eval_now();
+                    let standv = self.eval_clean();
                     if standv >= beta - 5 {
                         let margin = 50 + 8 * depth;
                         let sbeta = ts - margin;

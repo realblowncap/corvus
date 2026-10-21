@@ -55,6 +55,7 @@ A solo developed, good UCI chess engine.
 | Check extensions | One extra ply when the side to move is in check |
 | Mate distance pruning | Mates scored relative to the current node so the engine picks the fastest mate |
 | Draw detection | 50-move rule and threefold repetition (correctly ignoring the current node's own key) |
+| Endgame tablebases | Optional **Syzygy** probing (root + in-search WDL) via the vendored Fathom prober — see below |
 
 ### Evaluation
 - Material + **piece-square tables**, symmetric for both colors
@@ -156,10 +157,76 @@ src/
 ├── movegen.rs    # legal move generation
 ├── perft.rs      # perft + divide
 ├── eval.rs       # symmetric evaluation
+├── nnue.rs       # SF19-format network parser/validator
+├── nnue_forward.rs # accumulator + forward pass
+├── wdl.rs        # Stockfish-style WDL score presentation
+├── syzygy.rs     # Syzygy tablebase probing (Fathom FFI)
 ├── search.rs     # iterative deepening, alpha-beta/PVS, quiescence, TT
 ├── uci.rs        # UCI protocol loop
 └── main.rs       # CLI entry point
+
+vendor/fathom/    # vendored Syzygy prober (compiled by build.rs)
 ```
+
+## 🧩 Syzygy tablebases (optional)
+
+Endgame tablebase probing is provided through the vendored
+[Fathom](https://github.com/jdart1/Fathom) prober, compiled by `build.rs`. The
+C compile is intentionally **non-fatal**: on a machine without a C compiler the
+engine builds normally and simply plays without tablebases.
+
+The tablebase files themselves are large (3-4-5 piece is ~1 GB; 6 piece ~150 GB)
+and are **not** part of this repository, so a fresh clone has no tablebases and
+CI runs without them. Fetch the 3-4-5 piece set (`.rtbw` **and** `.rtbz`):
+
+```bash
+mkdir -p syzygy && cd syzygy
+BASE=https://tablebase.lichess.ovh/tables/standard
+for d in 3-4-5-wdl 3-4-5-dtz; do
+  ext=rtbw; [ "$d" = "3-4-5-dtz" ] && ext=rtbz
+  curl -s "$BASE/$d/" | grep -oE "href=\"[^\"]+\.$ext\"" | sed 's/href="//;s/"//' |
+    xargs -I{} curl -sO "$BASE/$d/{}"
+done
+```
+
+### Loading
+
+Tablebases are found **automatically** — no GUI setup needed. At startup the
+engine looks, in order, at:
+
+1. `$CORVUS_SYZYGY_PATH` (set this to point anywhere)
+2. `./syzygy` and `syzygy/`
+3. `syzygy/` next to the executable
+4. `~/.local/share/corvus/syzygy`
+
+The first directory that actually contains `.rtbw` files is loaded, and the
+engine reports it:
+
+```
+info string Syzygy tablebases up to 5 pieces from ./syzygy
+```
+
+An explicit `setoption name SyzygyPath value /absolute/path` always wins over
+auto-discovery. Because Fathom maps the tables once per process, a *different*
+`SyzygyPath` set after a directory is already loaded cannot take effect; the
+engine says so rather than silently ignoring it.
+
+### Options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `SyzygyPath` | `<empty>` | Directory (or `:`-separated list). Overrides auto-discovery. |
+| `SyzygyProbeDepth` | `1` | Do not probe shallower than this depth. |
+| `SyzygyProbeLimit` | `7` | Maximum number of pieces to probe. |
+| `Syzygy50MoveRule` | `true` | Treat cursed wins / blessed losses as draws. |
+
+Probing requires the position to have **no castling rights**, as tablebases are
+defined without them. `tbhits` in the `info` line reports how many probes
+succeeded.
+
+**Note:** the root probe needs the `.rtbz` (DTZ) files; with only `.rtbw` (WDL)
+present, in-search WDL probing still works but the engine will not play the
+tablebase-optimal move at the root.
 
 ## 📜 License
 

@@ -24,7 +24,7 @@ fn main() {
     // Test search_root directly
     println!("\n=== Testing search_root directly ===");
     let (mv, sc) = s.search_root(1, -10000, 10000);
-    println!("search_root result: move={} score={}", mv.uci(), sc);
+    println!("search_root result: move={} score={}", mv.map(|m| m.uci()).unwrap_or_default(), sc);
     println!("Nodes searched: {}", s.nodes);
     println!("Stopped: {}", s.stopped);
     
