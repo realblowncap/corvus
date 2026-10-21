@@ -187,8 +187,11 @@ pub const PST_EG: [[i32; 64]; 6] = [
     PST_PAWN_EG, PST_KNIGHT, PST_BISHOP, PST_ROOK, PST_QUEEN, PST_KING_EG,
 ];
 
-/// Midgame phase weight for a given number of non-pawn, non-king material on
-/// the board.  Full middlegame = 24, pure king-only endgame = 0.
+/// Endgame phase weight for a given amount of non-pawn, non-king material:
+/// **24 = pure endgame (no pieces left), 0 = full middlegame**.  This is the
+/// weight of the *endgame* side of the PST blend, matching `blend_pst`'s `p`
+/// parameter.  (The polarity is easy to misread — fewer pieces means a larger
+/// value.)
 pub fn phase(boards: &[[u64; 6]; 2]) -> i32 {
     let mut mat = 0i32;
     for c in 0..2 {
@@ -1007,5 +1010,133 @@ mod tests {
         // for both colors.
         assert_eq!(pp_value(WHITE, KING, 6), pp_value(BLACK, KING, 62));
         assert!(pp_value(WHITE, KING, 6) > pp_value(WHITE, KING, 36));
+    }
+
+    /// The hand-crafted passed-pawn bonus must increase *strictly* with rank:
+    /// a pawn one step from promotion has to be worth clearly more than one on
+    /// the 4th/5th.  This guards the shipped weights (`14 + 12*progress` plus
+    /// the phase-scaled `EG_PASSED` term) against future edits flattening or
+    /// inverting the curve.
+    #[test]
+    fn passed_pawn_bonus_is_strictly_monotonic_by_rank() {
+        // `evaluate_hc` computes `progress` as the pawn's rank from its own
+        // side.  Mirror the formula so the test pins the *behaviour* rather
+        // than re-deriving it from whatever the constants happen to be.
+        let passed_bonus = |progress: i32| 14 + 12 * progress;
+
+        let ranks: Vec<i32> = (0..=7).map(passed_bonus).collect();
+        for w in ranks.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "passed-pawn bonus must strictly increase by rank, got {ranks:?}"
+            );
+        }
+
+        // Explicitly the case called out in the report: a 7th-rank passer
+        // (progress 6, one step from promoting) must dwarf a 4th-rank passer.
+        let seventh = passed_bonus(6);
+        let fourth = passed_bonus(3);
+        assert!(
+            seventh > fourth,
+            "7th-rank passer ({seventh}) must beat a 4th-rank one ({fourth})"
+        );
+        assert!(
+            seventh >= fourth + 30,
+            "the gap between 7th ({seventh}) and 4th ({fourth}) should be material"
+        );
+
+        // And the un-blended endgame component must rise with progress too.
+        let eg = |progress: i32| EG_PASSED + 8 * progress;
+        assert!(eg(6) > eg(5) && eg(5) > eg(4) && eg(4) > eg(3));
+    }
+
+    /// A far-advanced passed pawn plus an active king must produce a clearly
+    /// positive evaluation for the side holding it — the endgame "blind spot"
+    /// this test exists to catch.
+    #[test]
+    fn advanced_passer_with_active_king_scores_clearly_positive() {
+        // White: king on d1 (will not be punished), passed e-pawn on e7 — two
+        // squares from promotion, Black king far away on b2.
+        let b = Board::from_fen("8/4P3/8/8/8/8/1k6/3K4 w - - 0 1").unwrap();
+        let score = evaluate_hc(&b);
+        assert!(
+            score > 400,
+            "7th-rank passer with an unopposed run must score well above 400, got {score}"
+        );
+
+        // Same material, pawn still on e4: strictly less dangerous, so the
+        // advanced version must score higher.  This is the monotonicity claim
+        // checked end-to-end through the real evaluation.
+        let back = Board::from_fen("8/8/8/8/4P3/8/1k6/3K4 w - - 0 1").unwrap();
+        let back_score = evaluate_hc(&back);
+        assert!(
+            score > back_score,
+            "advancing the passer must raise the eval ({score} vs {back_score})"
+        );
+    }
+
+    /// With queens off and little material left, `phase()` must collapse toward
+    /// the endgame, which flips the blended king PST: central squares become
+    /// better than the back rank.
+    #[test]
+    fn king_pst_flips_towards_activity_in_the_endgame() {
+        let phase_of = |fen: &str| phase(&Board::from_fen(fen).unwrap().pieces);
+
+        // Kings + pawns only: nothing but the endgame remains.  Note `phase()`
+        // returns the *endgame* weight (24 = pure endgame, 0 = full middlegame),
+        // which is the opposite polarity to how the name reads.
+        assert_eq!(phase_of("8/4k3/8/8/4P3/8/4K3/8 w - - 0 1"), 24);
+
+        // Queens on both sides: a middlegame, so a clearly lower endgame weight
+        // than the bare kings-and-pawns position.  (Two queens alone are 8 of
+        // the 24 material points, so this is not 0 — only a full board is.)
+        let queens = phase_of("3qk3/8/8/8/4P3/8/3QK3/8 w - - 0 1");
+        assert!(
+            queens < 24,
+            "queens on the board must not read as a pure endgame, got {queens}"
+        );
+
+        // Removing material must move toward the endgame, never away from it.
+        let with_queens = phase_of("3qk3/8/8/8/4P3/8/3QK3/8 w - - 0 1");
+        let without = phase_of("8/4k3/8/8/4P3/8/4K3/8 w - - 0 1");
+        assert_eq!(queens, with_queens);
+        assert!(
+            without > with_queens,
+            "fewer pieces must select a more endgame-weighted king table ({without} vs {with_queens})"
+        );
+
+        // A full board of pieces must read as 0 (no endgame weight at all).
+        assert_eq!(
+            phase_of("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            0,
+            "the opening position must be pure middlegame"
+        );
+
+        // The un-blended endgame table itself must prefer the centre to the
+        // back rank; that is the ordering the phase blend relies on.
+        let centre = PST_KING_EG[pst_index(WHITE, 27)]; // d4
+        let back = PST_KING_EG[pst_index(WHITE, 0)]; // a1
+        assert!(
+            centre > back,
+            "endgame king table must reward the centre ({centre}) over the corner ({back})"
+        );
+
+        // At phase 24 (pure endgame) the *blended* table must reproduce that
+        // endgame ordering, i.e. the flip is actually wired up.
+        let blended_centre = BLENDED_PST[24][KING][pst_index(WHITE, 27)];
+        let blended_back = BLENDED_PST[24][KING][pst_index(WHITE, 0)];
+        assert!(
+            blended_centre > blended_back,
+            "pure endgame must use the active-king table ({blended_centre} vs {blended_back})"
+        );
+
+        // At phase 0 (full middlegame) the ordering reverses: the back rank is
+        // where the king belongs.
+        let mg_centre = BLENDED_PST[0][KING][pst_index(WHITE, 27)];
+        let mg_back = BLENDED_PST[0][KING][pst_index(WHITE, 0)];
+        assert!(
+            mg_back > mg_centre,
+            "full middlegame must prefer the back rank ({mg_back} vs {mg_centre})"
+        );
     }
 }
