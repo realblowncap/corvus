@@ -620,6 +620,18 @@ impl Board {
         self.side = us;
     }
 
+    /// True when square `sq` is attacked by any piece of colour `by`.
+    ///
+    /// Sliding attacks come from the magic bitboard tables: the attack set of
+    /// a rook (resp. bishop) on `sq` is one mask + multiply + shift + table
+    /// load, so the whole test costs two branchless table probes instead of
+    /// eight ray scans with eight data-dependent branches.  The ray version
+    /// had to guess the first blocker on every direction, and those branches
+    /// mispredict constantly on a real board.
+    ///
+    /// The slider sets are intersected with `occ` so that the probe is
+    /// bit-exact with the old ray scan: a slider only counts as an attacker
+    /// when it really stands on the ray.
     pub fn attacked(&self, by: usize, sq: usize) -> bool {
         if self.pieces[by][PAWN] & PAWN_ATTACKS[by ^ 1][sq] != 0 {
             return true;
@@ -630,58 +642,14 @@ impl Board {
         if self.pieces[by][KING] & KING_ATTACKS[sq] != 0 {
             return true;
         }
-        let rooks = self.pieces[by][ROOK] | self.pieces[by][QUEEN];
-        let bishops = self.pieces[by][BISHOP] | self.pieces[by][QUEEN];
-        if rooks != 0 {
-            // The only pieces that can attack `sq` along a rook ray are those
-            // sitting on the first occupied square of that ray. Checking each
-            // first blocker directly avoids a full magic-table (L2) probe on
-            // this hot path; each direction is unrolled so there are no
-            // iteration or indexing costs.
-            let occ = self.all;
-            let blockers = RAY[sq][0] & occ; // N
-            if blockers != 0 {
-                let first = blockers & blockers.wrapping_neg();
-                if rooks & first != 0 { return true; }
-            }
-            let blockers = RAY[sq][2] & occ; // E
-            if blockers != 0 {
-                let first = blockers & blockers.wrapping_neg();
-                if rooks & first != 0 { return true; }
-            }
-            let blockers = RAY[sq][4] & occ; // S
-            if blockers != 0 {
-                let last = 1u64 << (63 - blockers.leading_zeros());
-                if rooks & last != 0 { return true; }
-            }
-            let blockers = RAY[sq][6] & occ; // W
-            if blockers != 0 {
-                let last = 1u64 << (63 - blockers.leading_zeros());
-                if rooks & last != 0 { return true; }
-            }
+        let occ = self.all;
+        let rooks = (self.pieces[by][ROOK] | self.pieces[by][QUEEN]) & occ;
+        if rooks != 0 && rook_attacks(occ, sq) & rooks != 0 {
+            return true;
         }
-        if bishops != 0 {
-            let occ = self.all;
-            let blockers = RAY[sq][1] & occ; // NE
-            if blockers != 0 {
-                let first = blockers & blockers.wrapping_neg();
-                if bishops & first != 0 { return true; }
-            }
-            let blockers = RAY[sq][3] & occ; // SE
-            if blockers != 0 {
-                let first = blockers & blockers.wrapping_neg();
-                if bishops & first != 0 { return true; }
-            }
-            let blockers = RAY[sq][5] & occ; // SW
-            if blockers != 0 {
-                let last = 1u64 << (63 - blockers.leading_zeros());
-                if bishops & last != 0 { return true; }
-            }
-            let blockers = RAY[sq][7] & occ; // NW
-            if blockers != 0 {
-                let last = 1u64 << (63 - blockers.leading_zeros());
-                if bishops & last != 0 { return true; }
-            }
+        let bishops = (self.pieces[by][BISHOP] | self.pieces[by][QUEEN]) & occ;
+        if bishops != 0 && bishop_attacks(occ, sq) & bishops != 0 {
+            return true;
         }
         false
     }
@@ -909,6 +877,85 @@ mod tests {
             assert_eq!(b.pst, b.compute_pst(), "pst drift after {}", m.uci());
             b.unmake(m);
             assert_eq!(b.pst, b.compute_pst(), "pst drift after unmake {}", m.uci());
+        }
+    }
+
+    /// Ray-walking reference for `Board::attacked`, kept as the oracle for the
+    /// magic-bitboard implementation.
+    fn attacked_by_rays(b: &Board, by: usize, sq: usize) -> bool {
+        if b.pieces[by][PAWN] & PAWN_ATTACKS[by ^ 1][sq] != 0 {
+            return true;
+        }
+        if b.pieces[by][KNIGHT] & KNIGHT_ATTACKS[sq] != 0 {
+            return true;
+        }
+        if b.pieces[by][KING] & KING_ATTACKS[sq] != 0 {
+            return true;
+        }
+        let rooks = b.pieces[by][ROOK] | b.pieces[by][QUEEN];
+        let bishops = b.pieces[by][BISHOP] | b.pieces[by][QUEEN];
+        let occ = b.all;
+        for d in 0..8usize {
+            let blockers = RAY[sq][d] & occ;
+            if blockers == 0 {
+                continue;
+            }
+            let first = if DIRD[d] > 0 {
+                blockers & blockers.wrapping_neg()
+            } else {
+                1u64 << (63 - blockers.leading_zeros())
+            };
+            let sliders = if d % 2 == 0 { rooks } else { bishops };
+            if sliders & first != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn attacked_matches_ray_reference() {
+        // Walk a few hundred random positions and compare the magic-bitboard
+        // `attacked()` against the ray-walking oracle on every square.
+        let mut b = Board::startpos();
+        let mut rng = 0x243F_6A88_85A3_08D3u64;
+        for _ in 0..300 {
+            for sq in 0..64 {
+                for by in 0..2 {
+                    assert_eq!(
+                        attacked_by_rays(&b, by, sq),
+                        b.attacked(by, sq),
+                        "attacked() disagrees at {sq} (colour {by}) in {}",
+                        b.to_fen()
+                    );
+                }
+            }
+            let mut moves = crate::movegen::MoveList::new();
+            crate::movegen::generate_legal(&mut b, &mut moves);
+            if moves.is_empty() {
+                break;
+            }
+            rng = splitmix(rng);
+            let m = moves.as_slice()[(rng as usize) % moves.len];
+            let _ = b.make(m);
+        }
+    }
+
+    #[test]
+    fn in_check_matches_ray_reference() {
+        let mut b = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+        let mut rng = 0x1319_8A2E_0370_7344u64;
+        for _ in 0..300 {
+            assert_eq!(b.in_check(WHITE), attacked_by_rays(&b, BLACK, b.kingsq[WHITE]));
+            assert_eq!(b.in_check(BLACK), attacked_by_rays(&b, WHITE, b.kingsq[BLACK]));
+            let mut moves = crate::movegen::MoveList::new();
+            crate::movegen::generate_legal(&mut b, &mut moves);
+            if moves.is_empty() {
+                break;
+            }
+            rng = splitmix(rng);
+            let m = moves.as_slice()[(rng as usize) % moves.len];
+            let _ = b.make(m);
         }
     }
 

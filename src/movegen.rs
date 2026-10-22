@@ -399,36 +399,23 @@ pub fn generate_captures(b: &Board, list: &mut MoveList) {
     list.retain(|m| m.captured != NO_PIECE || m.promo != NO_PIECE);
 }
 
+/// All pieces of `color` that attack `sq` given the occupancy `occ`.
+///
+/// Sliding attackers come from the magic bitboard tables: two branchless
+/// probes replace the eight per-ray first-blocker scans.
 fn attackers_mask(b: &Board, occ: u64, sq: usize, color: usize) -> u64 {
     let mut m = PAWN_ATTACKS[color ^ 1][sq] & b.pieces[color][PAWN];
     m |= KNIGHT_ATTACKS[sq] & b.pieces[color][KNIGHT];
     m |= KING_ATTACKS[sq] & b.pieces[color][KING];
-    // First blockers along each ray are the only possible slider attackers.
-    let rooks = b.pieces[color][ROOK] | b.pieces[color][QUEEN];
-    let bishops = b.pieces[color][BISHOP] | b.pieces[color][QUEEN];
-    for d in [0usize, 2, 4, 6] {
-        let blockers = RAY[sq][d] & occ;
-        if blockers == 0 {
-            continue;
-        }
-        let first = if DIRD[d] > 0 {
-            blockers & blockers.wrapping_neg()
-        } else {
-            1u64 << (63 - blockers.leading_zeros())
-        };
-        m |= rooks & first;
+    // Intersecting with `occ` keeps the probe bit-exact with a first-blocker
+    // ray scan: a slider only counts when it really stands on the ray.
+    let rooks = (b.pieces[color][ROOK] | b.pieces[color][QUEEN]) & occ;
+    if rooks != 0 {
+        m |= rook_attacks(occ, sq) & rooks;
     }
-    for d in [1usize, 3, 5, 7] {
-        let blockers = RAY[sq][d] & occ;
-        if blockers == 0 {
-            continue;
-        }
-        let first = if DIRD[d] > 0 {
-            blockers & blockers.wrapping_neg()
-        } else {
-            1u64 << (63 - blockers.leading_zeros())
-        };
-        m |= bishops & first;
+    let bishops = (b.pieces[color][BISHOP] | b.pieces[color][QUEEN]) & occ;
+    if bishops != 0 {
+        m |= bishop_attacks(occ, sq) & bishops;
     }
     m
 }
@@ -491,6 +478,88 @@ mod tests {
             list.iter().any(|m| m.from == 22 && m.to == 29 && m.piece == PAWN),
             "g3xf4 missing from legal moves"
         );
+    }
+
+    /// Ray-walking reference for `attackers_mask`, kept as the oracle for the
+    /// magic-bitboard implementation.
+    fn attackers_mask_by_rays(b: &Board, occ: u64, sq: usize, color: usize) -> u64 {
+        let mut m = PAWN_ATTACKS[color ^ 1][sq] & b.pieces[color][PAWN];
+        m |= KNIGHT_ATTACKS[sq] & b.pieces[color][KNIGHT];
+        m |= KING_ATTACKS[sq] & b.pieces[color][KING];
+        let rooks = b.pieces[color][ROOK] | b.pieces[color][QUEEN];
+        let bishops = b.pieces[color][BISHOP] | b.pieces[color][QUEEN];
+        for d in 0..8usize {
+            let blockers = RAY[sq][d] & occ;
+            if blockers == 0 {
+                continue;
+            }
+            let first = if DIRD[d] > 0 {
+                blockers & blockers.wrapping_neg()
+            } else {
+                1u64 << (63 - blockers.leading_zeros())
+            };
+            let sliders = if d % 2 == 0 { rooks } else { bishops };
+            m |= sliders & first;
+        }
+        m
+    }
+
+    /// SEE reference driven by the ray-walking attacker scan.
+    fn see_by_rays(b: &Board, sq: usize, stm: usize) -> i32 {
+        fn rec(b: &Board, sq: usize, side: usize, occ: u64, on_sq: i32, can_pass: bool) -> i32 {
+            let atk = attackers_mask_by_rays(b, occ, sq, side);
+            let mut att = None;
+            for pc in PAWN..=QUEEN {
+                let p = atk & b.pieces[side][pc] & occ;
+                if p != 0 {
+                    att = Some((p.trailing_zeros() as usize, PIECE_VALUES[pc]));
+                    break;
+                }
+            }
+            let (att_sq, att_val) = match att {
+                Some(x) => x,
+                None => return 0,
+            };
+            let occ2 = occ & !bit(att_sq);
+            let resp = rec(b, sq, side ^ 1, occ2, att_val, true);
+            let gain = on_sq - resp;
+            if can_pass {
+                gain.max(0)
+            } else {
+                gain
+            }
+        }
+        if b.piece_on(sq) == NO_PIECE {
+            return 0;
+        }
+        let occ = b.all & !bit(sq);
+        rec(b, sq, stm, occ, PIECE_VALUES[b.piece_on(sq)], false)
+    }
+
+    #[test]
+    fn see_matches_ray_reference() {
+        let mut b = Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..60 {
+            for sq in 0..64 {
+                for stm in 0..2 {
+                    assert_eq!(
+                        see_by_rays(&b, sq, stm),
+                        see(&b, sq, stm),
+                        "SEE disagrees at {sq} (colour {stm}) in {}",
+                        b.to_fen()
+                    );
+                }
+            }
+            let mut moves = MoveList::new();
+            generate_legal(&mut b, &mut moves);
+            if moves.is_empty() {
+                break;
+            }
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let m = moves.as_slice()[(rng >> 33) as usize % moves.len];
+            let _ = b.make(m);
+        }
     }
 
     #[test]
