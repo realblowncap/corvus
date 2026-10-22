@@ -367,19 +367,68 @@ fn make_index_pair(
 // Active feature enumeration (from-scratch / refresh path).
 // ---------------------------------------------------------------------------
 
-fn active_psq(pos: &NnuePos, perspective: usize, tb: &ThreatTables) -> Vec<u32> {
+/// Upper bounds on the number of active features in one perspective.
+///
+///  * PSQ: one feature per piece on the board (32) plus head-room.
+///  * Threats: one feature per (attacker, target) pair; both are board
+///    squares, so at most 32 * 32 = 1024 pairs exist.
+///  * Pawn pairs: unordered pairs of pawns sharing a band, at most
+///    C(16,2) white-white + 16*16 white-black + C(16,2) black-black = 496.
+const MAX_PSQ_FEATURES: usize = 64;
+const MAX_THREAT_FEATURES: usize = 1024;
+const MAX_PAIR_FEATURES: usize = 512;
+
+/// The active feature indices of one perspective.
+///
+/// Fixed-capacity buffers keep the evaluation allocation-free: the old
+/// `Vec`-returning helpers heap-allocated (and re-allocated while growing)
+/// six times per evaluation, which is pure overhead on a path that runs
+/// hundreds of thousands of times per second.
+pub struct ActiveFeatures {
+    psq: [u32; MAX_PSQ_FEATURES],
+    psq_len: usize,
+    threats: [u32; MAX_THREAT_FEATURES],
+    threats_len: usize,
+    pairs: [u32; MAX_PAIR_FEATURES],
+    pairs_len: usize,
+}
+
+impl ActiveFeatures {
+    fn new() -> Self {
+        ActiveFeatures {
+            psq: [0; MAX_PSQ_FEATURES],
+            psq_len: 0,
+            threats: [0; MAX_THREAT_FEATURES],
+            threats_len: 0,
+            pairs: [0; MAX_PAIR_FEATURES],
+            pairs_len: 0,
+        }
+    }
+}
+
+fn active_psq(
+    out: &mut ActiveFeatures,
+    pos: &NnuePos,
+    perspective: usize,
+    tb: &ThreatTables,
+) {
     let ksq = pos.ksq[perspective];
-    let mut out = Vec::with_capacity(pos.piece_count);
     let mut occ = pos.occ;
     while occ != 0 {
         let s = lsb(occ);
         occ &= occ - 1;
-        out.push(make_index_psq(perspective, s, pos.piece[s], ksq, tb));
+        out.psq[out.psq_len] = make_index_psq(perspective, s, pos.piece[s], ksq, tb);
+        out.psq_len += 1;
+        debug_assert!(out.psq_len <= MAX_PSQ_FEATURES);
     }
-    out
 }
 
-fn active_threats(pos: &NnuePos, perspective: usize, tb: &ThreatTables) -> Vec<u32> {
+fn active_threats(
+    out: &mut ActiveFeatures,
+    pos: &NnuePos,
+    perspective: usize,
+    tb: &ThreatTables,
+) {
     let ksq = pos.ksq[perspective];
     let occ = pos.occ;
     let pawn_targets = pos.pieces_type(KNIGHT) | pos.pieces_type(ROOK);
@@ -388,8 +437,6 @@ fn active_threats(pos: &NnuePos, perspective: usize, tb: &ThreatTables) -> Vec<u
         | pos.pieces_type(BISHOP)
         | pos.pieces_type(ROOK);
     let queen_targets = minor_slider_targets | pos.pieces_type(QUEEN);
-
-    let mut out = Vec::new();
 
     // Pawn diagonal attacks. Pawns target knights and rooks only.
     let pawn_moves = [
@@ -409,7 +456,9 @@ fn active_threats(pos: &NnuePos, perspective: usize, tb: &ThreatTables) -> Vec<u
             let attacker = ((c << 3) + PAWN) as u8;
             let idx = make_index_threat(perspective, attacker, from, to, attacked, ksq, tb);
             if (idx as usize) < FULL_THREATS_DIM {
-                out.push(idx);
+                out.threats[out.threats_len] = idx;
+                out.threats_len += 1;
+                debug_assert!(out.threats_len <= MAX_THREAT_FEATURES);
             }
         }
     }
@@ -432,23 +481,23 @@ fn active_threats(pos: &NnuePos, perspective: usize, tb: &ThreatTables) -> Vec<u
                     let to = lsb(attacks);
                     attacks &= attacks - 1;
                     let attacked = pos.piece[to];
-                    let idx = make_index_threat(perspective, attacker, from, to, attacked, ksq, tb);
+                    let idx =
+                        make_index_threat(perspective, attacker, from, to, attacked, ksq, tb);
                     if (idx as usize) < FULL_THREATS_DIM {
-                        out.push(idx);
+                        out.threats[out.threats_len] = idx;
+                        out.threats_len += 1;
+                        debug_assert!(out.threats_len <= MAX_THREAT_FEATURES);
                     }
                 }
             }
         }
     }
-
-    out
 }
 
-fn active_pairs(pos: &NnuePos, perspective: usize) -> Vec<u32> {
+fn active_pairs(out: &mut ActiveFeatures, pos: &NnuePos, perspective: usize) {
     let ksq = pos.ksq[perspective];
     let white = pos.pieces_c(WHITE, PAWN);
     let black = pos.pieces_c(BLACK, PAWN);
-    let mut out = Vec::new();
 
     // White pawns: pair with remaining white pawns (each unordered pair once,
     // because `bb` is consumed as we iterate) and with all black pawns.
@@ -461,13 +510,17 @@ fn active_pairs(pos: &NnuePos, perspective: usize) -> Vec<u32> {
         while ww != 0 {
             let to = lsb(ww);
             ww &= ww - 1;
-            out.push(make_index_pair(perspective, WHITE, from, to, WHITE, ksq));
+            out.pairs[out.pairs_len] = make_index_pair(perspective, WHITE, from, to, WHITE, ksq);
+            out.pairs_len += 1;
+            debug_assert!(out.pairs_len <= MAX_PAIR_FEATURES);
         }
         let mut wb = band & black;
         while wb != 0 {
             let to = lsb(wb);
             wb &= wb - 1;
-            out.push(make_index_pair(perspective, WHITE, from, to, BLACK, ksq));
+            out.pairs[out.pairs_len] = make_index_pair(perspective, WHITE, from, to, BLACK, ksq);
+            out.pairs_len += 1;
+            debug_assert!(out.pairs_len <= MAX_PAIR_FEATURES);
         }
     }
 
@@ -481,11 +534,11 @@ fn active_pairs(pos: &NnuePos, perspective: usize) -> Vec<u32> {
         while bbk != 0 {
             let to = lsb(bbk);
             bbk &= bbk - 1;
-            out.push(make_index_pair(perspective, BLACK, from, to, BLACK, ksq));
+            out.pairs[out.pairs_len] = make_index_pair(perspective, BLACK, from, to, BLACK, ksq);
+            out.pairs_len += 1;
+            debug_assert!(out.pairs_len <= MAX_PAIR_FEATURES);
         }
     }
-
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -497,51 +550,78 @@ struct PerspectiveAcc {
     psqt: [i32; PSQ_T_BUCKETS],
 }
 
-fn accumulate(pos: &NnuePos, perspective: usize, net: &ParsedNetwork, tb: &ThreatTables) -> PerspectiveAcc {
-    let mut acc = [0i16; L1];
-    for j in 0..L1 {
-        acc[j] = net.ft_biases[j];
+impl PerspectiveAcc {
+    fn new() -> Self {
+        PerspectiveAcc {
+            acc: [0i16; L1],
+            psqt: [0i32; PSQ_T_BUCKETS],
+        }
     }
-    let mut psqt = [0i32; PSQ_T_BUCKETS];
+}
+
+/// Scatter the active features into the accumulator.
+///
+/// Every feature owns a full row of L1 weights, so the inner loop is a
+/// 1024-wide vectorisable add.  The weight rows are sliced out of the
+/// matrices once per feature: indexing the `Vec`s directly leaves a bounds
+/// check on every element, which blocks vectorisation and costs ~40%.
+fn accumulate(
+    pos: &NnuePos,
+    perspective: usize,
+    net: &ParsedNetwork,
+    tb: &ThreatTables,
+    acc: &mut PerspectiveAcc,
+) {
+    let mut feats = ActiveFeatures::new();
+    active_psq(&mut feats, pos, perspective, tb);
+    active_threats(&mut feats, pos, perspective, tb);
+    active_pairs(&mut feats, pos, perspective);
+
+    acc.acc.copy_from_slice(&net.ft_biases[..L1]);
+    acc.psqt = [0i32; PSQ_T_BUCKETS];
 
     // HalfKAv2_hm (PSQ) features: int16 weights + int32 psqt.
-    for &f in active_psq(pos, perspective, tb).iter() {
+    for &f in &feats.psq[..feats.psq_len] {
         let row = f as usize * L1;
-        for j in 0..L1 {
-            acc[j] = acc[j].wrapping_add(net.ft_weights[row + j]);
+        let w = &net.ft_weights[row..row + L1];
+        for (a, x) in acc.acc.iter_mut().zip(w.iter()) {
+            *a = a.wrapping_add(*x);
         }
         let prow = f as usize * PSQ_T_BUCKETS;
-        for b in 0..PSQ_T_BUCKETS {
-            psqt[b] += net.ft_psqt_weights[prow + b];
+        let pw = &net.ft_psqt_weights[prow..prow + PSQ_T_BUCKETS];
+        for (p, x) in acc.psqt.iter_mut().zip(pw.iter()) {
+            *p = p.wrapping_add(*x);
         }
     }
 
     // FullThreats features: int8 weights (sign-extended) + int32 psqt.
-    for &g in active_threats(pos, perspective, tb).iter() {
+    for &g in &feats.threats[..feats.threats_len] {
         let row = g as usize * L1;
-        for j in 0..L1 {
-            acc[j] = acc[j].wrapping_add(net.threat_weights[row + j] as i16);
+        let w = &net.threat_weights[row..row + L1];
+        for (a, x) in acc.acc.iter_mut().zip(w.iter()) {
+            *a = a.wrapping_add(*x as i16);
         }
         let prow = g as usize * PSQ_T_BUCKETS;
-        for b in 0..PSQ_T_BUCKETS {
-            psqt[b] += net.threat_psqt[prow + b];
+        let pw = &net.threat_psqt[prow..prow + PSQ_T_BUCKETS];
+        for (p, x) in acc.psqt.iter_mut().zip(pw.iter()) {
+            *p = p.wrapping_add(*x);
         }
     }
 
     // PP_3Wide features (indices offset by FULL_THREATS_DIM).
-    for &gp in active_pairs(pos, perspective).iter() {
+    for &gp in &feats.pairs[..feats.pairs_len] {
         let g = gp as usize - FULL_THREATS_DIM;
         let row = g * L1;
-        for j in 0..L1 {
-            acc[j] = acc[j].wrapping_add(net.pawn_pair_weights[row + j] as i16);
+        let w = &net.pawn_pair_weights[row..row + L1];
+        for (a, x) in acc.acc.iter_mut().zip(w.iter()) {
+            *a = a.wrapping_add(*x as i16);
         }
         let prow = g * PSQ_T_BUCKETS;
-        for b in 0..PSQ_T_BUCKETS {
-            psqt[b] += net.pawn_pair_psqt[prow + b];
+        let pw = &net.pawn_pair_psqt[prow..prow + PSQ_T_BUCKETS];
+        for (p, x) in acc.psqt.iter_mut().zip(pw.iter()) {
+            *p = p.wrapping_add(*x);
         }
     }
-
-    PerspectiveAcc { acc, psqt }
 }
 
 // SCReLU transform: output[offset + j] = clamp(acc[j],0,255)*clamp(acc[j+512],0,255)/512.
@@ -564,8 +644,9 @@ fn propagate(input: &[u8; L1], stack: &crate::nnue::LayerStack) -> i32 {
     for j in 0..L2 {
         let mut sum = stack.fc_0.biases[j];
         let row = j * stack.fc_0.padded_input_dims;
-        for i in 0..L1 {
-            sum += (stack.fc_0.weights[row + i] as i32) * (input[i] as i32);
+        let w = &stack.fc_0.weights[row..row + L1];
+        for (x, i) in w.iter().zip(input.iter()) {
+            sum += (*x as i32) * (*i as i32);
         }
         fc0[j] = sum;
     }
@@ -585,8 +666,9 @@ fn propagate(input: &[u8; L1], stack: &crate::nnue::LayerStack) -> i32 {
     for j in 0..L2 {
         let mut sum = stack.fc_1.biases[j];
         let row = j * stack.fc_1.padded_input_dims;
-        for i in 0..2 * L2 {
-            sum += (stack.fc_1.weights[row + i] as i32) * (concat[i] as i32);
+        let w = &stack.fc_1.weights[row..row + 2 * L2];
+        for (x, i) in w.iter().zip(concat[..2 * L2].iter()) {
+            sum += (*x as i32) * (*i as i32);
         }
         fc1[j] = sum;
     }
@@ -632,8 +714,10 @@ pub fn evaluate_parts(net: &ParsedNetwork, board: &Board) -> (i32, i32) {
     let nstm = stm ^ 1;
     let bucket = (pos.piece_count - 1) / 4;
 
-    let acc_stm = accumulate(&pos, stm, net, tb);
-    let acc_nstm = accumulate(&pos, nstm, net, tb);
+    let mut acc_stm = PerspectiveAcc::new();
+    let mut acc_nstm = PerspectiveAcc::new();
+    accumulate(&pos, stm, net, tb, &mut acc_stm);
+    accumulate(&pos, nstm, net, tb, &mut acc_nstm);
 
     // psqt = (psqtAccum[stm][bucket] - psqtAccum[nstm][bucket]) / 2.
     let psqt_raw = (acc_stm.psqt[bucket] - acc_nstm.psqt[bucket]) / 2;
