@@ -152,6 +152,14 @@ impl TT {
 /// scores are bit-identical to an uncached search.
 struct EvalHat {
     keys: Box<[u64]>,
+    /// Halfmove clock that each cached value was computed with.  The static
+    /// evaluation is *not* a function of the position alone: Stockfish damps
+    /// it linearly as the 50-move counter runs up (`v - v*half/199`), so the
+    /// same piece placement reached with a different halfmove clock has a
+    /// different value.  Keying the cache on the position alone would return
+    /// a stale, undamped (or wrongly damped) score.  `u32::MAX` marks an
+    /// empty slot.
+    halves: Box<[u32]>,
     vals: Box<[i32]>,
     mask: usize,
 }
@@ -161,15 +169,16 @@ impl EvalHat {
         let n = slots.next_power_of_two();
         EvalHat {
             keys: vec![0u64; n].into_boxed_slice(),
+            halves: vec![u32::MAX; n].into_boxed_slice(),
             vals: vec![0i32; n].into_boxed_slice(),
             mask: n - 1,
         }
     }
 
     #[inline(always)]
-    fn probe(&self, key: u64) -> Option<i32> {
+    fn probe(&self, key: u64, half: u32) -> Option<i32> {
         let i = key as usize & self.mask;
-        if self.keys[i] == key {
+        if self.keys[i] == key && self.halves[i] == half {
             Some(self.vals[i])
         } else {
             None
@@ -177,9 +186,10 @@ impl EvalHat {
     }
 
     #[inline(always)]
-    fn insert(&mut self, key: u64, val: i32) {
+    fn insert(&mut self, key: u64, half: u32, val: i32) {
         let i = key as usize & self.mask;
         self.keys[i] = key;
+        self.halves[i] = half;
         self.vals[i] = val;
     }
 }
@@ -337,6 +347,9 @@ pub struct Searcher {
     pub tb_conf: TbConfig,
     pub eval_cache_key: u64,
     pub eval_cache_val: i32,
+    /// Halfmove clock the cached eval was computed with; the static eval
+    /// depends on it, so a mismatch invalidates `eval_cache_val`.
+    pub eval_cache_half: u32,
     eval_hat: EvalHat,
     pub eval_noise: i32,
     pub shared_depth: Option<Arc<AtomicU32>>,
@@ -390,6 +403,7 @@ impl Searcher {
             tb_conf: TbConfig::default(),
             eval_cache_key: u64::MAX,
             eval_cache_val: 0,
+            eval_cache_half: u32::MAX,
             eval_hat: EvalHat::new(1 << 20),
             eval_noise: 0,
             shared_depth: None,
@@ -408,20 +422,25 @@ impl Searcher {
 
     /// Evaluate the current position, memoizing the result per zobrist key so
     /// that repeated static-eval calls at the same node are computed once.
+    /// The halfmove clock is part of the cache key: the evaluation is damped
+    /// linearly as the 50-move counter runs up, so the same piece placement
+    /// reached with a different clock is a *different* evaluation.
     /// A per-thread `eval_noise` is added for Lazy SMP search diversity.
     fn eval_now(&mut self) -> i32 {
-        if self.eval_cache_key == self.board.key {
+        let half = self.board.half;
+        if self.eval_cache_key == self.board.key && self.eval_cache_half == half {
             return self.eval_cache_val + self.eval_noise;
         }
-        let v = match self.eval_hat.probe(self.board.key) {
+        let v = match self.eval_hat.probe(self.board.key, half) {
             Some(h) => h,
             None => {
                 let w = evaluate(&self.board);
-                self.eval_hat.insert(self.board.key, w);
+                self.eval_hat.insert(self.board.key, half, w);
                 w
             }
         };
         self.eval_cache_key = self.board.key;
+        self.eval_cache_half = half;
         self.eval_cache_val = v;
         v + self.eval_noise
     }
@@ -1095,6 +1114,13 @@ impl Searcher {
         if self.tb_conf.enabled
             && self.tb_conf.probe_limit > 0
             && (depth as i32) >= self.tb_conf.probe_depth
+            // Fathom's WDL tables classify a win as cursed/blessed relative to
+            // a *fresh* 50-move clock; `tb_probe_wdl_impl` cannot see the real
+            // halfmove clock (it is hard-coded to 0 inside Fathom), so probing
+            // with a non-zero clock would report a win that is only a cursed
+            // win as a full win -- and vice versa.  Stockfish 19 gates the
+            // same in-tree probe on `rule50_count() == 0` for this reason.
+            && self.board.half == 0
         {
             let tb_probe = crate::syzygy::probe_wdl(&self.board, self.tb_conf.probe_limit);
             if tb_probe.is_some() {
@@ -1727,6 +1753,52 @@ fn score_string(score: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eval_cache_distinguishes_halfmove_clocks() {
+        let mut hat = EvalHat::new(1024);
+        let key = 0x1234_5678_9ABC_DEF0u64;
+
+        // An empty slot must never hit.
+        assert_eq!(hat.probe(key, 0), None);
+        assert_eq!(hat.probe(key, 40), None);
+
+        hat.insert(key, 0, 500);
+        assert_eq!(hat.probe(key, 0), Some(500));
+        // The static evaluation is damped by the halfmove clock, so the same
+        // placement reached with a different clock is a *different* number and
+        // must not be served from the cache.
+        assert_eq!(hat.probe(key, 40), None);
+
+        // Re-inserting with the new clock replaces the entry.
+        hat.insert(key, 40, 300);
+        assert_eq!(hat.probe(key, 40), Some(300));
+        assert_eq!(hat.probe(key, 0), None);
+    }
+
+    #[test]
+    fn eval_cache_is_invalidated_when_the_halfmove_clock_changes() {
+        let b = Board::from_fen("4k3/8/8/8/8/8/8/3QK3 w - - 0 1").unwrap();
+        let mut s = Searcher::new(b);
+        assert_eq!(s.eval_cache_half, u32::MAX);
+
+        let v0 = s.eval_now();
+        assert_eq!(s.eval_cache_half, 0);
+        assert_eq!(s.eval_cache_key, s.board.key);
+
+        // Same piece placement, different halfmove clock.
+        s.board.half = 40;
+        let v40 = s.eval_now();
+        assert_eq!(s.eval_cache_half, 40, "the memo must be keyed on the clock");
+        assert_eq!(s.eval_cache_key, s.board.key);
+
+        // With the neural network in play the damped evaluation differs; with
+        // the hand-crafted fallback it does not, so only assert the stronger
+        // property when a net is actually loaded.
+        if crate::eval::nnue_active() {
+            assert_ne!(v0, v40, "rule-50 damping must change the evaluation");
+        }
+    }
 
     #[test]
     fn probe_unprobe_round_trip() {

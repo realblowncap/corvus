@@ -438,13 +438,30 @@ fn evaluate_nnue(net: &ParsedNetwork, b: &Board) -> i32 {
     let v = nnue + (nnue * material as i64) / 91000;
 
     // Damp the evaluation linearly when shuffling (50-move rule).
-    let v = v - (v * b.half as i64) / 199;
+    let v = rule50_damp(v, b.half);
 
     // Convert internal units -> centipawns via Stockfish's WDL model so the value
     // shares the hand-crafted evaluator's scale (a pawn ~ 100 cp).  Without this
     // the NNUE output (~2.8-3.4x centipawns) would mismatch the search's
     // centipawn-tuned pruning margins and LMR tables.
     (100.0 * v as f64 / wdl_scale_a(b)).round() as i32
+}
+
+/// True when a neural network is loaded and in use for the static evaluation.
+///
+/// The hand-crafted fallback evaluator does not depend on the halfmove clock,
+/// so callers that care about rule-50 damping must check this first.
+pub fn nnue_active() -> bool {
+    nnue_net().is_some()
+}
+
+/// Stockfish's rule-50 damping: the evaluation is scaled down linearly as the
+/// halfmove clock runs up.  This makes the static evaluation a function of
+/// (position, halfmove clock) rather than of the position alone -- the same
+/// piece placement reached after more shuffling is worth less.
+#[inline]
+pub fn rule50_damp(v: i64, half: u32) -> i64 {
+    v - (v * half as i64) / 199
 }
 
 /// Evaluate with an explicitly provided network — the same centipawn pipeline
@@ -982,6 +999,30 @@ fn evaluate_hc(b: &Board) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule50_damp_scales_the_eval_with_the_halfmove_clock() {
+        // Stockfish's rule-50 damping: v - v*half/199.  The sign is preserved,
+        // the magnitude shrinks monotonically, and a full clock (99) roughly
+        // halves the evaluation.
+        let v = 1000i64;
+        assert_eq!(rule50_damp(v, 0), 1000);
+        assert_eq!(rule50_damp(v, 99), 1000 - (1000 * 99) / 199);
+        assert_eq!(rule50_damp(v, 99), 503);
+
+        let mut prev = v + 1;
+        for half in 0..=120u32 {
+            let d = rule50_damp(v, half);
+            assert!(d <= prev, "damping must not increase with the clock");
+            assert!(d >= 0, "damping must not flip the sign");
+            prev = d;
+        }
+
+        // A negative evaluation is damped towards zero by the same amount.
+        assert_eq!(rule50_damp(-1000, 0), -1000);
+        assert_eq!(rule50_damp(-1000, 99), -503);
+        assert!(rule50_damp(-1000, 50) > -1000);
+    }
 
     #[test]
     fn pst_orientation_is_white_perspective() {
