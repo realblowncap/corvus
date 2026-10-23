@@ -17,3 +17,10 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# No `target-cpu` is set on purpose: the binary has to run on every x86-64
+# machine.  The hot NNUE loops (feature transform, output layer) select their
+# instruction set at run time instead -- see the `transform`/`propagate`
+# dispatch in `src/nnue_forward.rs`.  Building with
+# `RUSTFLAGS="-C target-cpu=native"` still gives a little extra on top, but it
+# is not required to get most of the speedup.

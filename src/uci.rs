@@ -383,6 +383,12 @@ fn drain_result(state: &mut CommandState) {
     }
 }
 
+/// Parse a `position` command and record the position history of the game
+/// it describes.
+///
+/// The history is needed for repetition detection: the search itself only
+/// knows the moves it plays, so it cannot see that the position it is about
+/// to play has already occurred twice in the game.
 fn parse_position(board: &mut Board, tokens: &[&str]) {
     let mut i = 0;
     let mut fen = String::new();
@@ -408,12 +414,17 @@ fn parse_position(board: &mut Board, tokens: &[&str]) {
         }
     }
 
+    // The position history of the game.  It starts with the position the
+    // game was set up from and grows with every move.
+    board.game_history = vec![board.key];
+
     if i < tokens.len() && tokens[i] == "moves" {
         i += 1;
         while i < tokens.len() {
             match board.uci_move(tokens[i]) {
                 Some(m) => {
                     let _ = board.make(m);
+                    board.record_game_move(m);
                 }
                 None => outln(format!("info string illegal or unknown move '{}'", tokens[i])),
             }

@@ -209,6 +209,23 @@ pub struct Board {
     pub history: Vec<Undo>,
     /// O(1) piece lookup: `(color << 3) | piece`, or `EMPTY_SQ`.
     pub mailbox: [u8; 64],
+    /// The position keys of the game that led to this position.
+    ///
+    /// The search only sees the moves it makes itself, so without this a
+    /// repetition that spans the game/search boundary is invisible and the
+    /// engine happily repeats a drawn position.  Only the positions since
+    /// the last irreversible move are kept: a pawn move or a capture can
+    /// never be undone, so nothing before it can recur.
+    pub game_history: Vec<u64>,
+    /// Whether `make` should record the NNUE dirty state of the move.
+    ///
+    /// Recording it costs a threat enumeration per move, which is wasted
+    /// work for callers that never evaluate incrementally (perft, book
+    /// probes, the UCI `eval` command), so the search switches it on.
+    pub nnue_track: bool,
+    /// The NNUE dirty state of the most recent move (valid only when
+    /// `nnue_track` was set).
+    pub last_dirty: crate::nnue_dirty::DirtyState,
 }
 
 #[inline]
@@ -232,6 +249,9 @@ impl Board {
             pst: 0,
             history: Vec::new(),
             mailbox: [EMPTY_SQ; 64],
+            nnue_track: false,
+            last_dirty: crate::nnue_dirty::DirtyState::default(),
+            game_history: Vec::new(),
         }
     }
 
@@ -400,6 +420,20 @@ impl Board {
         }
     }
 
+    /// Record a played game move in the repetition history.
+    ///
+    /// The history is truncated after an irreversible move: a pawn move or a
+    /// capture can never be undone, so no position from before it can ever
+    /// recur and must not be counted towards a three-fold repetition.
+    pub fn record_game_move(&mut self, m: Move) {
+        let irreversible = m.piece == PAWN || m.captured != NO_PIECE;
+        self.game_history.push(self.key);
+        if irreversible {
+            let len = self.game_history.len();
+            self.game_history.drain(0..len - 1);
+        }
+    }
+
     pub fn make(&mut self, m: Move) -> bool {
         self.make_impl(m, false)
     }
@@ -418,6 +452,40 @@ impl Board {
         let from = m.from;
         let to = m.to;
         let pt = m.piece;
+
+        // Record what the NNUE accumulator will have to be patched with.
+        // The squares whose occupant changes are known before the move is
+        // applied, so the "old position" half of the dirty state can be
+        // collected here, before anything is mutated.
+        let mut dirty = if self.nnue_track {
+            let mut d = crate::nnue_dirty::DirtyBuilder::new();
+            let mut changed = [from, to, 0usize, 0usize];
+            let mut n_changed = 2;
+            if m.flags & M_EP != 0 {
+                let esq = if us == WHITE { to - 8 } else { to + 8 };
+                if self.pieces[them][PAWN] & bit(esq) != 0 {
+                    changed[n_changed] = esq;
+                    n_changed += 1;
+                }
+            }
+            if m.flags & M_CASTLE != 0 {
+                let (rk_f, rk_t) = if from < to { (from + 3, to - 1) } else { (from - 4, to + 1) };
+                changed[n_changed] = rk_f;
+                changed[n_changed + 1] = rk_t;
+                n_changed += 2;
+            }
+            d.set_changed(&changed[..n_changed]);
+            let view = crate::nnue_dirty::BoardView {
+                occ: self.all,
+                types: &self.pieces,
+                mailbox: &self.mailbox,
+            };
+            d.before(&view);
+            Some(d)
+        } else {
+            None
+        };
+        let occ_before = self.all;
 
         self.history.push(Undo {
             castle: self.castle,
@@ -548,6 +616,20 @@ impl Board {
 
         self.side = them;
         self.key ^= side_key();
+
+        // The "new position" half of the dirty state.
+        if let Some(d) = dirty.as_mut() {
+            if pt == KING {
+                d.mark_king_moved(us);
+            }
+            let view = crate::nnue_dirty::BoardView {
+                occ: self.all,
+                types: &self.pieces,
+                mailbox: &self.mailbox,
+            };
+            d.after(&view, occ_before);
+            self.last_dirty = d.state;
+        }
 
         // Legality: the mover's king must not be attacked afterwards.  The scan can
         // be skipped only when the mover was provably not in check, the move is
@@ -1049,6 +1131,30 @@ mod tests {
                 check(&rebuilt, "fen roundtrip");
             }
         }
+    }
+
+    /// The game history keeps only the positions that can still recur: after
+    /// an irreversible move everything before it is dropped.
+    #[test]
+    fn game_history_is_truncated_at_irreversible_moves() {
+        let mut b = Board::from_fen("4k1n1/8/8/8/8/8/4P3/4K1N1 w - - 0 1").unwrap();
+        b.game_history = vec![b.key];
+
+        // Two plies of reversible knight moves: the history grows.
+        for uci in ["g1f3", "g8f6"] {
+            let m = b.uci_move(uci).unwrap();
+            assert!(b.make(m), "{uci} should be legal");
+            b.record_game_move(m);
+        }
+        assert_eq!(b.game_history.len(), 3);
+
+        // A pawn move is irreversible: only the position right after it is
+        // kept, because nothing before it can ever recur.
+        let m = b.uci_move("e2e3").unwrap();
+        assert!(b.make(m));
+        b.record_game_move(m);
+        assert_eq!(b.game_history.len(), 1);
+        assert_eq!(b.game_history.last().copied(), Some(b.key));
     }
 
     #[test]

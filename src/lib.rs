@@ -21,6 +21,7 @@ pub mod book;
 pub mod eval;
 pub mod movegen;
 pub mod nnue;
+pub mod nnue_dirty;
 pub mod nnue_forward;
 pub mod perft;
 pub mod san;

@@ -113,7 +113,7 @@ fn load_network() -> Option<ParsedNetwork> {
 }
 
 /// Returns the loaded network, or `None` if unavailable (hand-crafted fallback).
-fn nnue_net() -> Option<Arc<ParsedNetwork>> {
+pub fn nnue_net() -> Option<Arc<ParsedNetwork>> {
     // Fast path: already resolved for the currently requested `EvalFile`.
     if let NetState::Loaded(net) = &*NNUE_NET.read().unwrap() {
         return Some(net.clone());
@@ -424,8 +424,18 @@ fn pinned_mask(b: &Board, side: usize) -> u64 {
 ///
 /// Reproduces Stockfish's `Eval::evaluate` pipeline (optimism term omitted as
 /// corvus has no optimism signal), then converts internal units -> centipawns.
-fn evaluate_nnue(net: &ParsedNetwork, b: &Board) -> i32 {
-    let (psqt, positional) = nnue_forward::evaluate_parts(net, b);
+fn evaluate_nnue(net: &ParsedNetwork, b: &Board, acc: Option<&nnue_forward::Accumulator>) -> i32 {
+    // With an up-to-date accumulator the feature transformer and the output
+    // layer run on the *patched* accumulator instead of a full rebuild, which
+    // is where most of the evaluation time goes.  A stale accumulator (key
+    // mismatch) falls back to the full rebuild.
+    let (psqt, positional) = match acc {
+        Some(a) if a.key == b.key => {
+            let count = b.all.count_ones() as usize;
+            nnue_forward::evaluate_parts_accum(net, a, b.side, count)
+        }
+        _ => nnue_forward::evaluate_parts(net, b),
+    };
     let nnue0 = psqt + positional; // internal units, side-to-move perspective
 
     // Blend eval with NNUE complexity: nnue -= nnue * |psqt - positional| / 18236.
@@ -468,14 +478,27 @@ pub fn rule50_damp(v: i64, half: u32) -> i64 {
 /// as `evaluate()`, for callers that own their net (`nnue::NnueEval`) instead
 /// of using the process-wide cache.
 pub fn evaluate_with_net(net: &ParsedNetwork, b: &Board) -> i32 {
-    evaluate_nnue(net, b)
+    evaluate_nnue(net, b, None)
+}
+
+/// Evaluate `b`, reusing `acc` when it belongs to `b`.
+///
+/// The accumulator is the incrementally maintained NNUE feature state; when
+/// its zobrist key matches the board it is patched in place and the
+/// transformer does not have to re-accumulate every feature.
+pub fn evaluate_with_accum(
+    net: &ParsedNetwork,
+    b: &Board,
+    acc: Option<&nnue_forward::Accumulator>,
+) -> i32 {
+    evaluate_nnue(net, b, acc)
 }
 
 /// Public entry point: NNUE if the network is loaded, else the hand-crafted
 /// evaluation.  Both paths return a score from the side-to-move's perspective.
 pub fn evaluate(b: &Board) -> i32 {
     match nnue_net() {
-        Some(net) => evaluate_nnue(&net, b),
+        Some(net) => evaluate_nnue(&net, b, None),
         None => evaluate_hc(b),
     }
 }

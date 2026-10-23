@@ -16,7 +16,8 @@
 
 use crate::bitboard::*;
 use crate::board::*;
-use crate::eval::{evaluate, MATE, PIECE_VALUES};
+use crate::eval::{evaluate, evaluate_with_accum, MATE, PIECE_VALUES};
+use crate::nnue_forward::Accumulator;
 use crate::movegen::{
     generate_captures, generate_legal, generate_pseudo, gives_check_fast, MoveList, ScoredMoveList,
 };
@@ -343,6 +344,10 @@ pub struct Searcher {
     pub nodes_limit: u64,
     pub key_stack: Vec<u64>,
     pub irr_boundary: Vec<bool>,
+    /// How many irreversible moves the current search path contains.  The
+    /// game history in front of the root is only relevant while this is
+    /// zero, so it is kept as a counter instead of being recomputed.
+    irr_count: usize,
     pub null_ep: Vec<Option<usize>>,
     pub tb_conf: TbConfig,
     pub eval_cache_key: u64,
@@ -369,6 +374,19 @@ pub struct Searcher {
     pub show_wdl: bool,
     pub move_overhead: u64,
     pub nodestime: u64,
+    /// NNUE accumulator stack: one entry per ply, mirroring the board's
+    /// move stack.  `acc_stack[0]` belongs to the root position, the last
+    /// entry to the position currently being searched.  Each entry is derived
+    /// from its parent by patching the changed feature rows instead of
+    /// re-accumulating the whole network.
+    acc_stack: Vec<Accumulator>,
+    /// The network the accumulator stack was built with.  Cached here so the
+    /// hot path does not have to take the network lock on every node.
+    nnue: Option<std::sync::Arc<crate::nnue::ParsedNetwork>>,
+    /// Whether the evaluation may use the incremental accumulator.  Turning
+    /// this off forces a full feature rebuild at every node; it exists so
+    /// that the two paths can be compared against each other.
+    pub use_accumulator: bool,
 }
 
 impl Searcher {
@@ -399,6 +417,7 @@ impl Searcher {
             nodes_limit: u64::MAX,
             key_stack: Vec::new(),
             irr_boundary: Vec::new(),
+            irr_count: 0,
             null_ep: Vec::new(),
             tb_conf: TbConfig::default(),
             eval_cache_key: u64::MAX,
@@ -417,6 +436,91 @@ impl Searcher {
             show_wdl: false,
             move_overhead: 10,
             nodestime: 0,
+            acc_stack: Vec::new(),
+            nnue: None,
+            use_accumulator: true,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // NNUE accumulator stack
+    // -----------------------------------------------------------------------
+
+    /// Rebuild the root accumulator from the current board position.
+    ///
+    /// Called whenever the search (re-)starts from the root: the accumulator
+    /// stack is then empty and the root entry describes the root position.
+    fn acc_reset_root(&mut self) {
+        self.acc_stack.clear();
+        let net = match crate::eval::nnue_net() {
+            Some(n) => n,
+            None => {
+                self.nnue = None;
+                return;
+            }
+        };
+        let mut acc = Accumulator::new();
+        acc.refresh(&net, &self.board);
+        self.acc_stack.push(acc);
+        self.nnue = Some(net);
+    }
+
+    /// Push the accumulator of the position that was just reached by a move.
+    ///
+    /// The board's dirty state describes exactly which feature rows changed,
+    /// so the child accumulator is a patched copy of the parent's.  A king
+    /// move (or a threat list that overflowed) forces a full rebuild of that
+    /// perspective, because every feature index depends on the king square.
+    fn acc_push(&mut self) {
+        let n = self.acc_stack.len();
+        if n == 0 {
+            return;
+        }
+        let net = match self.nnue.as_deref() {
+            Some(n) => n,
+            None => return,
+        };
+        let dirty = self.board.last_dirty;
+        let mut child = Accumulator::new();
+        {
+            let parent = &self.acc_stack[n - 1];
+            child.apply(parent, net, &dirty, &self.board);
+        }
+        self.acc_stack.push(child);
+    }
+
+    /// Push the accumulator of a null-move position.
+    ///
+    /// A null move does not change the piece placement, so no feature row
+    /// changes at all -- only the zobrist key (side to move and ep square).
+    fn acc_push_null(&mut self) {
+        let n = self.acc_stack.len();
+        if n == 0 {
+            return;
+        }
+        let mut acc = self.acc_stack[n - 1].clone();
+        acc.key = self.board.key;
+        self.acc_stack.push(acc);
+    }
+
+    /// Make sure the accumulator stack describes the current position.
+    ///
+    /// Called at the root of a search: if the stack does not describe the
+    /// board (a fresh searcher, a position that was set up directly), it is
+    /// rebuilt from scratch.
+    fn acc_ensure_root(&mut self) {
+        let ok = match self.acc_stack.last() {
+            Some(a) => a.key == self.board.key,
+            None => false,
+        };
+        if !ok {
+            self.acc_reset_root();
+        }
+    }
+
+    fn acc_pop(&mut self) {
+        if self.acc_stack.len() > 1 {
+            self.acc_stack.pop();
         }
     }
 
@@ -434,7 +538,7 @@ impl Searcher {
         let v = match self.eval_hat.probe(self.board.key, half) {
             Some(h) => h,
             None => {
-                let w = evaluate(&self.board);
+                let w = self.eval_accumulated();
                 self.eval_hat.insert(self.board.key, half, w);
                 w
             }
@@ -443,6 +547,25 @@ impl Searcher {
         self.eval_cache_half = half;
         self.eval_cache_val = v;
         v + self.eval_noise
+    }
+
+    /// Static evaluation of the current position, reusing the incrementally
+    /// maintained NNUE accumulator when it belongs to this position.
+    ///
+    /// The accumulator saves re-accumulating every feature of the network for
+    /// every node; it is only valid when its zobrist key matches the board,
+    /// otherwise the full rebuild is used.
+    fn eval_accumulated(&mut self) -> i32 {
+        match self.nnue.as_deref() {
+            Some(net) => {
+                let acc = match self.acc_stack.last() {
+                    Some(a) if self.use_accumulator && a.key == self.board.key => Some(a),
+                    _ => None,
+                };
+                evaluate_with_accum(net, &self.board, acc)
+            }
+            None => evaluate(&self.board),
+        }
     }
 
     /// Noise-free static evaluation, for paths whose *value* can escape this
@@ -546,26 +669,42 @@ impl Searcher {
 
     fn make(&mut self, m: Move) -> bool {
         let irr = m.piece == PAWN || m.captured != NO_PIECE;
+        let tracked = self.board.nnue_track;
+        self.board.nnue_track = true;
         let legal = self.board.make(m);
         if !legal {
             self.board.unmake(m);
+            self.board.nnue_track = tracked;
             return false;
         }
+        self.board.nnue_track = tracked;
+        self.acc_push();
         self.key_stack.push(self.board.key);
         self.irr_boundary.push(irr);
+        if irr {
+            self.irr_count += 1;
+        }
         self.moves_made.push(m);
         true
     }
 
     fn make_checked(&mut self, m: Move, was_in_check: bool) -> bool {
         let irr = m.piece == PAWN || m.captured != NO_PIECE;
+        let tracked = self.board.nnue_track;
+        self.board.nnue_track = true;
         let legal = self.board.make_checked(m, was_in_check);
         if !legal {
             self.board.unmake(m);
+            self.board.nnue_track = tracked;
             return false;
         }
+        self.board.nnue_track = tracked;
+        self.acc_push();
         self.key_stack.push(self.board.key);
         self.irr_boundary.push(irr);
+        if irr {
+            self.irr_count += 1;
+        }
         self.moves_made.push(m);
         true
     }
@@ -573,8 +712,11 @@ impl Searcher {
     fn unmake(&mut self, m: Move) {
         self.moves_made.pop();
         self.key_stack.pop();
-        self.irr_boundary.pop();
+        if self.irr_boundary.pop() == Some(true) {
+            self.irr_count -= 1;
+        }
         self.board.unmake(m);
+        self.acc_pop();
     }
 
     fn make_null(&mut self) {
@@ -582,12 +724,14 @@ impl Searcher {
         connected_to_board::zobrist_ep_clear(&mut self.board);
         self.board.side ^= 1;
         connected_to_board::zobrist_side(&mut self.board);
+        self.acc_push_null();
     }
 
     fn unmake_null(&mut self) {
         connected_to_board::zobrist_side(&mut self.board);
         self.board.side ^= 1;
         connected_to_board::zobrist_ep_restore(&mut self.board, self.null_ep.pop());
+        self.acc_pop();
     }
 
     fn poll_stop(&mut self) {
@@ -642,16 +786,46 @@ impl Searcher {
                 break;
             }
         }
-        false
+
+        // The moves played before the root are not on the search path, so a
+        // repetition that reaches back into the game has to be looked up in
+        // the game's own history.
+        self.game_history_repeated()
+    }
+
+    /// Whether the current position has occurred before in the game that led
+    /// to the root position.
+    ///
+    /// The game history only holds the positions since the last irreversible
+    /// move, so a match means the position really can recur.  It is ignored
+    /// as soon as the search itself made an irreversible move: the boundary
+    /// of the repetition window then lies inside the search, and everything
+    /// before it is irrelevant.
+    fn game_history_repeated(&self) -> bool {
+        if self.irr_count > 0 {
+            return false;
+        }
+        let hist = &self.board.game_history;
+        // The last entry is the root position itself; the search path check
+        // already covers the occurrence of the position the search is in.
+        if hist.len() < 2 {
+            return false;
+        }
+        let key = self.board.key;
+        hist[..hist.len() - 1].iter().any(|k| *k == key)
     }
 
     fn iter_reset(&mut self) {
+        // The board is back at the root position here, so the accumulator
+        // stack is rebuilt from it.
+        self.acc_reset_root();
         for k in self.killers.iter_mut() {
             k[0] = Move::normal(0, 0, 0, NO_PIECE);
             k[1] = Move::normal(0, 0, 0, NO_PIECE);
         }
         self.key_stack.clear();
         self.irr_boundary.clear();
+        self.irr_count = 0;
         self.null_ep.clear();
         self.moves_made.clear();
     }
@@ -982,6 +1156,8 @@ impl Searcher {
     ) -> (Option<Move>, i32) {
         let alpha0 = alpha;
         arena.reserve(0);
+        // The accumulator stack must describe the position we are searching.
+        self.acc_ensure_root();
         let mut list = MoveList::new();
         generate_pseudo(&self.board, &mut list);
         let tt_mov = self.tt.probe(self.board.key).map(|e| e.0);
@@ -1798,6 +1974,85 @@ mod tests {
         if crate::eval::nnue_active() {
             assert_ne!(v0, v40, "rule-50 damping must change the evaluation");
         }
+    }
+
+    /// The incrementally maintained accumulator must not change what the
+    /// search finds: the same position searched with and without it has to
+    /// produce the same score and the same best move.
+    #[test]
+    fn accumulator_does_not_change_the_search_result() {
+        if !crate::eval::nnue_active() {
+            return; // no network loaded: both paths use the fallback eval
+        }
+        const FENS: &[&str] = &[
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
+            "8/8/8/3pP3/8/8/8/K3k3 w - d6 0 2",
+        ];
+        for fen in FENS {
+            let mut with = Searcher::new(Board::from_fen(fen).unwrap());
+            let mut without = Searcher::new(Board::from_fen(fen).unwrap());
+            without.use_accumulator = false;
+
+            let (m1, s1) = with.search_root(6, -32000, 32000);
+            let (m2, s2) = without.search_root(6, -32000, 32000);
+            assert_eq!(s1, s2, "score differs in {fen}");
+            assert_eq!(m1, m2, "best move differs in {fen}");
+        }
+    }
+
+    /// A repetition that reaches back into the game before the search started
+    /// has to be detected; the search path alone cannot see it.
+    #[test]
+    fn repetition_spanning_the_game_boundary_is_detected() {
+        // Both sides shuffle their knights to and fro, so the position with
+        // the knights on f3/f6 occurs twice in the game.
+        let mut b = Board::from_fen("4k1n1/8/8/8/8/8/4P3/4K1N1 w - - 0 1").unwrap();
+        b.game_history = vec![b.key];
+        for uci in ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6"] {
+            let m = b.uci_move(uci).unwrap();
+            assert!(b.make(m), "{uci} should be legal");
+            b.record_game_move(m);
+        }
+
+        let s = Searcher::new(b);
+        assert!(s.game_history_repeated());
+
+        // A position that only occurred once does not count: the search path
+        // itself has to find the second occurrence.
+        let mut b2 = Board::from_fen("4k1n1/8/8/8/8/8/4P3/4K1N1 w - - 0 1").unwrap();
+        b2.game_history = vec![b2.key];
+        let m = b2.uci_move("g1f3").unwrap();
+        assert!(b2.make(m));
+        b2.record_game_move(m);
+        let s2 = Searcher::new(b2);
+        assert!(!s2.game_history_repeated());
+    }
+
+    /// Once the search itself has made an irreversible move, the history of
+    /// the game is irrelevant: nothing before it can recur.
+    #[test]
+    fn game_history_is_ignored_after_an_irreversible_search_move() {
+        let mut b = Board::from_fen("4k1n1/8/8/8/8/8/4P3/4K1N1 w - - 0 1").unwrap();
+        b.game_history = vec![b.key];
+        for uci in ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6"] {
+            let m = b.uci_move(uci).unwrap();
+            assert!(b.make(m), "{uci} should be legal");
+            b.record_game_move(m);
+        }
+
+        let mut s = Searcher::new(b);
+        assert!(s.game_history_repeated());
+
+        // A pawn push is irreversible, so the boundary of the repetition
+        // window moves into the search and the game history is dropped.
+        let m = s.board.uci_move("e2e3").unwrap();
+        assert!(s.make(m));
+        assert_eq!(s.irr_count, 1);
+        assert!(!s.game_history_repeated());
     }
 
     #[test]

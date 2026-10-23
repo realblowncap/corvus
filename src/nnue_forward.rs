@@ -13,8 +13,8 @@
 // natural ordering used here reproduces it exactly.
 
 use crate::bitboard::{
-    bishop_attacks, pawn_attacks, queen_attacks, rook_attacks, KING_ATTACKS, KNIGHT_ATTACKS, BLACK,
-    WHITE,
+    bishop_attacks, bit, pawn_attacks, queen_attacks, rook_attacks, KING_ATTACKS, KNIGHT_ATTACKS,
+    BLACK, WHITE,
 };
 use crate::board::Board;
 use crate::nnue::{ParsedNetwork, FULL_THREATS_DIM, L1, L2, PSQ_T_BUCKETS};
@@ -123,7 +123,7 @@ fn shift_dir(b: u64, dir: i32) -> u64 {
 
 // Squares that can host a pawn forming a pair with a pawn on `s`: own file plus
 // adjacent files, restricted to ranks 2-7, excluding `s` itself.
-fn pawn_pair_bb(s: usize) -> u64 {
+pub fn pawn_pair_bb(s: usize) -> u64 {
     let file = FILE_A << (s & 7);
     let files = file | shift_east(file) | shift_west(file);
     files & !(RANK_1 | RANK_8) & !(1u64 << s)
@@ -220,7 +220,7 @@ const NUM_VALID_TARGETS: [i32; 16] = [0, 4, 10, 8, 8, 10, 0, 0, 0, 4, 10, 8, 8, 
 // AllPieces order: W_PAWN..W_KING, B_PAWN..B_KING.
 const ALL_PIECES: [usize; 12] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14];
 
-struct ThreatTables {
+pub struct ThreatTables {
     king_buckets: [u32; 64],
     offsets: [[u32; 64]; 16],         // [attacker][from]
     helper_cum_piece: [u32; 16],      // cumulativePieceOffset per piece
@@ -304,7 +304,7 @@ fn build_threat_tables() -> ThreatTables {
     t
 }
 
-fn tables() -> &'static ThreatTables {
+pub fn tables() -> &'static ThreatTables {
     static TB: OnceLock<ThreatTables> = OnceLock::new();
     TB.get_or_init(build_threat_tables)
 }
@@ -314,7 +314,7 @@ fn tables() -> &'static ThreatTables {
 // ---------------------------------------------------------------------------
 
 // HalfKAv2_hm make_index.
-fn make_index_psq(perspective: usize, s: usize, pc: u8, ksq: usize, tb: &ThreatTables) -> u32 {
+pub fn make_index_psq(perspective: usize, s: usize, pc: u8, ksq: usize, tb: &ThreatTables) -> u32 {
     let flip = 56 * perspective;
     (s ^ halfka_orient(ksq) ^ flip) as u32
         + PIECE_SQUARE_INDEX[perspective][pc as usize]
@@ -322,7 +322,7 @@ fn make_index_psq(perspective: usize, s: usize, pc: u8, ksq: usize, tb: &ThreatT
 }
 
 // FullThreats make_index.
-fn make_index_threat(
+pub fn make_index_threat(
     perspective: usize,
     attacker: u8,
     from: usize,
@@ -343,7 +343,7 @@ fn make_index_threat(
 }
 
 // PP_3Wide make_index.
-fn make_index_pair(
+pub fn make_index_pair(
     perspective: usize,
     color: usize,
     from: usize,
@@ -545,20 +545,6 @@ fn active_pairs(out: &mut ActiveFeatures, pos: &NnuePos, perspective: usize) {
 // Accumulator + transform.
 // ---------------------------------------------------------------------------
 
-struct PerspectiveAcc {
-    acc: [i16; L1],
-    psqt: [i32; PSQ_T_BUCKETS],
-}
-
-impl PerspectiveAcc {
-    fn new() -> Self {
-        PerspectiveAcc {
-            acc: [0i16; L1],
-            psqt: [0i32; PSQ_T_BUCKETS],
-        }
-    }
-}
-
 /// Scatter the active features into the accumulator.
 ///
 /// Every feature owns a full row of L1 weights, so the inner loop is a
@@ -570,26 +556,27 @@ fn accumulate(
     perspective: usize,
     net: &ParsedNetwork,
     tb: &ThreatTables,
-    acc: &mut PerspectiveAcc,
+    acc: &mut [i16; L1],
+    psqt: &mut [i32; PSQ_T_BUCKETS],
 ) {
     let mut feats = ActiveFeatures::new();
     active_psq(&mut feats, pos, perspective, tb);
     active_threats(&mut feats, pos, perspective, tb);
     active_pairs(&mut feats, pos, perspective);
 
-    acc.acc.copy_from_slice(&net.ft_biases[..L1]);
-    acc.psqt = [0i32; PSQ_T_BUCKETS];
+    acc.copy_from_slice(&net.ft_biases[..L1]);
+    *psqt = [0i32; PSQ_T_BUCKETS];
 
     // HalfKAv2_hm (PSQ) features: int16 weights + int32 psqt.
     for &f in &feats.psq[..feats.psq_len] {
         let row = f as usize * L1;
         let w = &net.ft_weights[row..row + L1];
-        for (a, x) in acc.acc.iter_mut().zip(w.iter()) {
+        for (a, x) in acc.iter_mut().zip(w.iter()) {
             *a = a.wrapping_add(*x);
         }
         let prow = f as usize * PSQ_T_BUCKETS;
         let pw = &net.ft_psqt_weights[prow..prow + PSQ_T_BUCKETS];
-        for (p, x) in acc.psqt.iter_mut().zip(pw.iter()) {
+        for (p, x) in psqt.iter_mut().zip(pw.iter()) {
             *p = p.wrapping_add(*x);
         }
     }
@@ -598,12 +585,12 @@ fn accumulate(
     for &g in &feats.threats[..feats.threats_len] {
         let row = g as usize * L1;
         let w = &net.threat_weights[row..row + L1];
-        for (a, x) in acc.acc.iter_mut().zip(w.iter()) {
+        for (a, x) in acc.iter_mut().zip(w.iter()) {
             *a = a.wrapping_add(*x as i16);
         }
         let prow = g as usize * PSQ_T_BUCKETS;
         let pw = &net.threat_psqt[prow..prow + PSQ_T_BUCKETS];
-        for (p, x) in acc.psqt.iter_mut().zip(pw.iter()) {
+        for (p, x) in psqt.iter_mut().zip(pw.iter()) {
             *p = p.wrapping_add(*x);
         }
     }
@@ -613,19 +600,49 @@ fn accumulate(
         let g = gp as usize - FULL_THREATS_DIM;
         let row = g * L1;
         let w = &net.pawn_pair_weights[row..row + L1];
-        for (a, x) in acc.acc.iter_mut().zip(w.iter()) {
+        for (a, x) in acc.iter_mut().zip(w.iter()) {
             *a = a.wrapping_add(*x as i16);
         }
         let prow = g * PSQ_T_BUCKETS;
         let pw = &net.pawn_pair_psqt[prow..prow + PSQ_T_BUCKETS];
-        for (p, x) in acc.psqt.iter_mut().zip(pw.iter()) {
+        for (p, x) in psqt.iter_mut().zip(pw.iter()) {
             *p = p.wrapping_add(*x);
         }
     }
 }
 
 // SCReLU transform: output[offset + j] = clamp(acc[j],0,255)*clamp(acc[j+512],0,255)/512.
+/// The feature transform of one perspective.
+///
+/// This is the hottest loop of the whole engine: it runs twice per
+/// evaluation.  The 32-bit multiply it needs is only one instruction wide
+/// with SSE4.1 (`pmulld`); with the plain SSE2 baseline the compiler has to
+/// emulate it, which costs about half of the evaluation time.
+///
+/// The instruction set is detected at run time, so the binary still runs on
+/// machines without SSE4.1 (and on non-x86 targets use whatever the
+/// compiler generates there).
+#[inline]
 fn transform(acc: &[i16; L1], perspective_p: usize, output: &mut [u8; L1]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("sse4.1") {
+            // SAFETY: the feature was just checked to be present.
+            unsafe { transform_sse41(acc, perspective_p, output) };
+            return;
+        }
+    }
+    transform_generic(acc, perspective_p, output)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn transform_sse41(acc: &[i16; L1], perspective_p: usize, output: &mut [u8; L1]) {
+    transform_generic(acc, perspective_p, output)
+}
+
+#[inline(always)]
+fn transform_generic(acc: &[i16; L1], perspective_p: usize, output: &mut [u8; L1]) {
     let offset = (L1 / 2) * perspective_p;
     for j in 0..L1 / 2 {
         let sum0 = (acc[j] as i32).clamp(0, FT_MAX_VAL);
@@ -638,7 +655,29 @@ fn transform(acc: &[i16; L1], perspective_p: usize, output: &mut [u8; L1]) {
 // Network propagate (one layer stack).
 // ---------------------------------------------------------------------------
 
+/// The output layer: a dense matrix-vector product over the transformed
+/// features.  Like the transform it is dispatched on the CPU features at run
+/// time.
+#[inline]
 fn propagate(input: &[u8; L1], stack: &crate::nnue::LayerStack) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("sse4.1") {
+            // SAFETY: the feature was just checked to be present.
+            return unsafe { propagate_sse41(input, stack) };
+        }
+    }
+    propagate_generic(input, stack)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn propagate_sse41(input: &[u8; L1], stack: &crate::nnue::LayerStack) -> i32 {
+    propagate_generic(input, stack)
+}
+
+#[inline(always)]
+fn propagate_generic(input: &[u8; L1], stack: &crate::nnue::LayerStack) -> i32 {
     // fc_0: AffineTransformSparseInput<L1, L2>. Natural dense dot product.
     let mut fc0 = [0i32; L2];
     for j in 0..L2 {
@@ -696,6 +735,338 @@ fn propagate(input: &[u8; L1], stack: &crate::nnue::LayerStack) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Incremental accumulator
+// ---------------------------------------------------------------------------
+
+/// The NNUE accumulator of one position, for both perspectives.
+///
+/// The accumulator holds the *sum of the active feature weights* of the
+/// network's first layer.  Rebuilding it from scratch touches roughly 85
+/// weight rows (30 PSQ rows of 2 KiB plus 35 threat and 18 pawn-pair rows of
+/// 1 KiB) for each perspective, which dominates the evaluation.  Patching it
+/// with the handful of features that actually changed touches a fraction of
+/// that, which is what [`Accumulator::apply`] does.
+pub struct Accumulator {
+    /// Zobrist key of the position this accumulator belongs to.  Used as a
+    /// guard: a stale accumulator is detected and discarded instead of
+    /// silently producing a wrong score.
+    pub key: u64,
+    pub(crate) acc: [[i16; L1]; 2],
+    pub(crate) psqt: [[i32; PSQ_T_BUCKETS]; 2],
+}
+
+impl Clone for Accumulator {
+    fn clone(&self) -> Self {
+        Accumulator {
+            key: self.key,
+            acc: self.acc,
+            psqt: self.psqt,
+        }
+    }
+}
+
+impl Accumulator {
+    pub fn new() -> Self {
+        Accumulator {
+            key: 0,
+            acc: [[0i16; L1]; 2],
+            psqt: [[0i32; PSQ_T_BUCKETS]; 2],
+        }
+    }
+
+    /// Rebuild both perspectives from scratch.
+    pub fn refresh(&mut self, net: &ParsedNetwork, board: &Board) {
+        let pos = NnuePos::from_board(board);
+        let tb = tables();
+        for p in 0..2 {
+            accumulate(&pos, p, net, tb, &mut self.acc[p], &mut self.psqt[p]);
+        }
+        self.key = board.key;
+    }
+
+    /// Derive the accumulator of the child position from the parent's.
+    ///
+    /// `dirty` describes what changed; `board` is the *child* position.  A
+    /// perspective whose king moved is refreshed from scratch (every feature
+    /// index depends on the king square), the others are patched.
+    pub fn apply(
+        &mut self,
+        parent: &Accumulator,
+        net: &ParsedNetwork,
+        dirty: &crate::nnue_dirty::DirtyState,
+        board: &Board,
+    ) {
+        self.key = board.key;
+        if dirty.overflow || dirty.refresh[0] || dirty.refresh[1] {
+            // A king move invalidates every index of that perspective; a
+            // threat list that overflowed its buffer means we no longer know
+            // what changed, so that perspective has to be rebuilt as well.
+            let pos = NnuePos::from_board(board);
+            let tb = tables();
+            for p in 0..2 {
+                let refresh = dirty.overflow || dirty.refresh[p];
+                if refresh {
+                    accumulate(&pos, p, net, tb, &mut self.acc[p], &mut self.psqt[p]);
+                } else {
+                    self.acc[p].copy_from_slice(&parent.acc[p]);
+                    self.psqt[p].copy_from_slice(&parent.psqt[p]);
+                }
+            }
+        } else {
+            self.acc.copy_from_slice(&parent.acc);
+            self.psqt.copy_from_slice(&parent.psqt);
+        }
+
+        let tb = tables();
+        for p in 0..2 {
+            // Both the king-move refresh and a threat-list overflow leave a
+            // perspective that was just rebuilt from scratch; adding the
+            // deltas on top of it would count them twice.
+            if dirty.overflow || dirty.refresh[p] {
+                continue;
+            }
+            let ksq = board.kingsq[p];
+            apply_psq_deltas(&mut self.acc[p], &mut self.psqt[p], net, tb, dirty, p, ksq);
+            apply_threat_deltas(&mut self.acc[p], &mut self.psqt[p], net, tb, dirty, p, ksq);
+            apply_pair_deltas(&mut self.acc[p], &mut self.psqt[p], net, dirty, p, ksq);
+        }
+    }
+}
+
+impl Default for Accumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Add (`sign = 1`) or subtract (`sign = -1`) one weight row to the
+/// accumulator.
+///
+/// The sign is split into two loops on purpose: `w[i] * sign` would force a
+/// multiply per element and keep the loop from vectorizing, which costs more
+/// than the whole rest of the incremental update.
+#[inline(always)]
+fn accum_add(acc: &mut [i16], w: &[i16], sign: i32) {
+    if sign >= 0 {
+        for (a, x) in acc.iter_mut().zip(w.iter()) {
+            *a = a.wrapping_add(*x);
+        }
+    } else {
+        for (a, x) in acc.iter_mut().zip(w.iter()) {
+            *a = a.wrapping_sub(*x);
+        }
+    }
+}
+
+/// Same as [`accum_add`] but for the int8 threat and pawn-pair weights.
+#[inline(always)]
+fn accum_add_i8(acc: &mut [i16], w: &[i8], sign: i32) {
+    if sign >= 0 {
+        for (a, x) in acc.iter_mut().zip(w.iter()) {
+            *a = a.wrapping_add(*x as i16);
+        }
+    } else {
+        for (a, x) in acc.iter_mut().zip(w.iter()) {
+            *a = a.wrapping_sub(*x as i16);
+        }
+    }
+}
+
+#[inline(always)]
+fn psqt_add(psqt: &mut [i32], w: &[i32], sign: i32) {
+    if sign >= 0 {
+        for (p, x) in psqt.iter_mut().zip(w.iter()) {
+            *p = p.wrapping_add(*x);
+        }
+    } else {
+        for (p, x) in psqt.iter_mut().zip(w.iter()) {
+            *p = p.wrapping_sub(*x);
+        }
+    }
+}
+
+fn add_psq_row(
+    acc: &mut [i16; L1],
+    psqt: &mut [i32; PSQ_T_BUCKETS],
+    net: &ParsedNetwork,
+    idx: u32,
+    sign: i32,
+) {
+    let row = idx as usize * L1;
+    let w = &net.ft_weights[row..row + L1];
+    accum_add(acc, w, sign);
+    let prow = idx as usize * PSQ_T_BUCKETS;
+    let pw = &net.ft_psqt_weights[prow..prow + PSQ_T_BUCKETS];
+    psqt_add(psqt, pw, sign);
+}
+
+/// Add (`sign = 1`) or subtract (`sign = -1`) a row of the threat weights.
+#[inline]
+fn add_threat_row(
+    acc: &mut [i16; L1],
+    psqt: &mut [i32; PSQ_T_BUCKETS],
+    net: &ParsedNetwork,
+    idx: u32,
+    sign: i32,
+) {
+    let row = idx as usize * L1;
+    let w = &net.threat_weights[row..row + L1];
+    accum_add_i8(acc, w, sign);
+    let prow = idx as usize * PSQ_T_BUCKETS;
+    let pw = &net.threat_psqt[prow..prow + PSQ_T_BUCKETS];
+    psqt_add(psqt, pw, sign);
+}
+
+/// Add (`sign = 1`) or subtract (`sign = -1`) a row of the pawn-pair weights.
+#[inline]
+fn add_pair_row(
+    acc: &mut [i16; L1],
+    psqt: &mut [i32; PSQ_T_BUCKETS],
+    net: &ParsedNetwork,
+    idx: u32,
+    sign: i32,
+) {
+    let row = (idx as usize - FULL_THREATS_DIM) * L1;
+    let w = &net.pawn_pair_weights[row..row + L1];
+    accum_add_i8(acc, w, sign);
+    let prow = (idx as usize - FULL_THREATS_DIM) * PSQ_T_BUCKETS;
+    let pw = &net.pawn_pair_psqt[prow..prow + PSQ_T_BUCKETS];
+    psqt_add(psqt, pw, sign);
+}
+
+fn apply_psq_deltas(
+    acc: &mut [i16; L1],
+    psqt: &mut [i32; PSQ_T_BUCKETS],
+    net: &ParsedNetwork,
+    tb: &ThreatTables,
+    dirty: &crate::nnue_dirty::DirtyState,
+    perspective: usize,
+    ksq: usize,
+) {
+    for i in 0..dirty.placement_len {
+        let p = dirty.placements[i];
+        let sq = p.sq as usize;
+        if p.before != 0 {
+            let idx = make_index_psq(perspective, sq, p.before, ksq, tb);
+            add_psq_row(acc, psqt, net, idx, -1);
+        }
+        if p.after != 0 {
+            let idx = make_index_psq(perspective, sq, p.after, ksq, tb);
+            add_psq_row(acc, psqt, net, idx, 1);
+        }
+    }
+}
+
+fn apply_threat_deltas(
+    acc: &mut [i16; L1],
+    psqt: &mut [i32; PSQ_T_BUCKETS],
+    net: &ParsedNetwork,
+    tb: &ThreatTables,
+    dirty: &crate::nnue_dirty::DirtyState,
+    perspective: usize,
+    ksq: usize,
+) {
+    for i in 0..dirty.threat_len {
+        let t = dirty.threats[i];
+        let idx = make_index_threat(
+            perspective,
+            t.attacker,
+            t.from as usize,
+            t.to as usize,
+            t.attacked,
+            ksq,
+            tb,
+        );
+        if (idx as usize) >= FULL_THREATS_DIM {
+            continue;
+        }
+        add_threat_row(acc, psqt, net, idx, if t.add { 1 } else { -1 });
+    }
+}
+
+fn apply_pair_deltas(
+    acc: &mut [i16; L1],
+    psqt: &mut [i32; PSQ_T_BUCKETS],
+    net: &ParsedNetwork,
+    dirty: &crate::nnue_dirty::DirtyState,
+    perspective: usize,
+    ksq: usize,
+) {
+    let (wb, bk) = (dirty.pawns_before[0], dirty.pawns_before[1]);
+    let (wa, ba) = (dirty.pawns_after[0], dirty.pawns_after[1]);
+    if wb == wa && bk == ba {
+        return;
+    }
+    // Removed pairs: the pawns that vanished, paired with the pawns that
+    // were next to them before the move.
+    gen_pair_deltas(
+        acc,
+        psqt,
+        net,
+        perspective,
+        ksq,
+        wb & !wa,
+        bk & !ba,
+        wb,
+        bk,
+        -1,
+    );
+    // Added pairs: the pawns that appeared, paired with the pawns that are
+    // next to them now.
+    gen_pair_deltas(
+        acc,
+        psqt,
+        net,
+        perspective,
+        ksq,
+        wa & !wb,
+        ba & !bk,
+        wa,
+        ba,
+        1,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gen_pair_deltas(
+    acc: &mut [i16; L1],
+    psqt: &mut [i32; PSQ_T_BUCKETS],
+    net: &ParsedNetwork,
+    perspective: usize,
+    ksq: usize,
+    updated_w: u64,
+    updated_b: u64,
+    pawns_w: u64,
+    pawns_b: u64,
+    sign: i32,
+) {
+    let unchanged = (pawns_w | pawns_b) & !(updated_w | updated_b);
+    let mut u = updated_w | updated_b;
+    while u != 0 {
+        let a = u.trailing_zeros() as usize;
+        u &= u - 1;
+        // Partners are the unchanged pawns in the band plus the not yet
+        // processed updated pawns, so that every pair is emitted once.
+        let mask = pawn_pair_bb(a) & (unchanged | u);
+        let a_col = if pawns_b & bit(a) != 0 { BLACK } else { WHITE };
+        let mut pb = pawns_b & mask;
+        while pb != 0 {
+            let t = pb.trailing_zeros() as usize;
+            pb &= pb - 1;
+            let idx = make_index_pair(perspective, a_col, a, t, BLACK, ksq);
+            add_pair_row(acc, psqt, net, idx, sign);
+        }
+        let mut pw = pawns_w & mask;
+        while pw != 0 {
+            let t = pw.trailing_zeros() as usize;
+            pw &= pw - 1;
+            let idx = make_index_pair(perspective, a_col, a, t, WHITE, ksq);
+            add_pair_row(acc, psqt, net, idx, sign);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Top-level evaluation (side-to-move perspective, internal units).
 // ---------------------------------------------------------------------------
 
@@ -714,17 +1085,44 @@ pub fn evaluate_parts(net: &ParsedNetwork, board: &Board) -> (i32, i32) {
     let nstm = stm ^ 1;
     let bucket = (pos.piece_count - 1) / 4;
 
-    let mut acc_stm = PerspectiveAcc::new();
-    let mut acc_nstm = PerspectiveAcc::new();
-    accumulate(&pos, stm, net, tb, &mut acc_stm);
-    accumulate(&pos, nstm, net, tb, &mut acc_nstm);
+    let mut acc_stm = [0i16; L1];
+    let mut acc_nstm = [0i16; L1];
+    let mut psqt_stm = [0i32; PSQ_T_BUCKETS];
+    let mut psqt_nstm = [0i32; PSQ_T_BUCKETS];
+    accumulate(&pos, stm, net, tb, &mut acc_stm, &mut psqt_stm);
+    accumulate(&pos, nstm, net, tb, &mut acc_nstm, &mut psqt_nstm);
 
     // psqt = (psqtAccum[stm][bucket] - psqtAccum[nstm][bucket]) / 2.
-    let psqt_raw = (acc_stm.psqt[bucket] - acc_nstm.psqt[bucket]) / 2;
+    let psqt_raw = (psqt_stm[bucket] - psqt_nstm[bucket]) / 2;
 
     let mut transformed = [0u8; L1];
-    transform(&acc_stm.acc, 0, &mut transformed);
-    transform(&acc_nstm.acc, 1, &mut transformed);
+    transform(&acc_stm, 0, &mut transformed);
+    transform(&acc_nstm, 1, &mut transformed);
+
+    let positional_raw = propagate(&transformed, &net.stacks[bucket]);
+
+    (psqt_raw / OUTPUT_SCALE, positional_raw / OUTPUT_SCALE)
+}
+
+/// Same as [`evaluate_parts`], but reusing an already computed accumulator.
+///
+/// The accumulator must belong to `board`; the caller is responsible for
+/// that.  `piece_count` is the number of pieces on the board, which selects
+/// the network's PSQT bucket.
+pub fn evaluate_parts_accum(
+    net: &ParsedNetwork,
+    acc: &Accumulator,
+    stm: usize,
+    piece_count: usize,
+) -> (i32, i32) {
+    let nstm = stm ^ 1;
+    let bucket = (piece_count - 1) / 4;
+
+    let psqt_raw = (acc.psqt[stm][bucket] - acc.psqt[nstm][bucket]) / 2;
+
+    let mut transformed = [0u8; L1];
+    transform(&acc.acc[stm], 0, &mut transformed);
+    transform(&acc.acc[nstm], 1, &mut transformed);
 
     let positional_raw = propagate(&transformed, &net.stacks[bucket]);
 
